@@ -1,0 +1,48 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "0.1.0",
+  "FriendlyName": "MeshForge",
+  "Description": "Describe a prop or drop a reference image, generate it with an AI mesh provider, and get a game-ready static mesh imported with its textures, materials, collision and lightmap UVs. Owns one pipeline end to end - submit, poll, download, import, finish. Provider-agnostic: local runners and hosted services register through the same interface. Standalone: no gameplay framework dependency, no rigging, no skeletal meshes.",
+  "Category": "Automation Forge",
+  "CreatedBy": "Bojan Andrejek",
+  "CreatedByURL": "https://automation-forge-hq.web.app",
+  "DocsURL": "https://github.com/AutomationForgeHQ/MeshForge",
+  "MarketplaceURL": "",
+  "SupportURL": "https://github.com/AutomationForgeHQ/MeshForge/issues",
+  "EditorOnly": true,
+  "CanContainContent": false,
+  "IsBetaVersion": false,
+  "IsExperimentalVersion": true,
+  "Installed": false,
+  "Modules": [
+    {
+      "Name": "MeshForge",
+      "Type": "Editor",
+      "LoadingPhase": "PostEngineInit",
+      "TargetAllowList": [
+        "Editor"
+      ]
+    },
+    {
+      "Name": "MeshForgeEditor",
+      "Type": "Editor",
+      "LoadingPhase": "PostEngineInit",
+      "TargetAllowList": [
+        "Editor"
+      ]
+    }
+  ],
+  "Plugins": [
+    {
+      "Name": "GLTFExporter",
+      "Enabled": true,
+      "Comment": "The other direction: a post step that works on a mesh the project already has needs that mesh written out, and Epic ships the writer."
+    },
+    {
+      "Name": "InterchangeEditor",
+      "Enabled": true,
+      "Comment": "Providers hand back glTF, which Interchange translates into a static mesh with its materials and textures. Nothing here parses a mesh format by hand."
+    }
+  ]
+}
