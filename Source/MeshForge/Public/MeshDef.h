@@ -20,14 +20,13 @@ class UTexture2D;
  * being replaced, because on providers with no seed a take that is discarded can never be
  * recreated; the MeshId is the only route back to it.
  *
- * This asset deliberately stops at an imported UStaticMesh with its materials, textures, collision
- * and lightmap UVs. Placing it in a level, making a Blueprint of it, or wiring it to gameplay
+ * Generated geometry imports as a UStaticMesh with its materials, textures, collision
+ * and lightmap UVs. Native post steps may create a separate skeletal result. Placing either in a level, making a Blueprint of it, or wiring it to gameplay
  * belongs to whoever is building the level, not here.
  *
- * **Static meshes only, deliberately.** A generated character comes back as one watertight surface
- * with no skeleton and no part decomposition, so rigging it is a separate problem with separate
- * tools. Pretending otherwise here would mean a half-working skeletal path that is wrong for the
- * props this plugin is actually for.
+ * Rigging is an explicit native post step, never an implicit consequence of importing geometry.
+ * PostOutputs retains each stage's asset and immediate input; ImportedMesh continues to identify
+ * the last static result, while ImportedSkeletalMesh identifies the last skeletal result.
  *
  * **The declaration order below is the order the details panel draws.** Unreal sorts categories by
  * where each one first appears, so a property put in a tidy-looking place lands its whole category
@@ -431,6 +430,20 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "6 State")
 	void RefreshStaleness();
 
+	/**
+	 * Heal a definition that was saved while a job was in flight.
+	 *
+	 * The asset is written when a job *starts*, so a crash or a forced close leaves Running on disk -
+	 * and no job survives an editor restart, because they live in the subsystem's memory. Without
+	 * this the definition reloads wedged: IsBusy() is true forever, every run is refused with "Wait
+	 * for the current job to finish", and nothing can clear it, because Candidates, Stages and Status
+	 * are all read-only to tooling and to the details panel.
+	 *
+	 * PostLoad is the one place where "in flight" is guaranteed false, which is what makes this safe
+	 * rather than a guess.
+	 */
+	virtual void PostLoad() override;
+
 	/** True when jobs are in flight and a second submit would be a duplicate charge. */
 	UFUNCTION(BlueprintPure, Category = "6 State")
 	bool IsBusy() const;
@@ -450,6 +463,14 @@ public:
 	/** The imported mesh. This is what the plugin exists to produce. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "7 Result")
 	TSoftObjectPtr<UStaticMesh> ImportedMesh;
+
+	/** Each enabled post step creates a new output; earlier results remain available. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "7 Result")
+	TArray<FMeshPostOutput> PostOutputs;
+
+	/** Latest native skeletal result. The wrapped static result remains in ImportedMesh. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "7 Result")
+	TSoftObjectPtr<USkeletalMesh> ImportedSkeletalMesh;
 
 	/** What the last import produced and how well, including anything that went quietly wrong. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "7 Result")

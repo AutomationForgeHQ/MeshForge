@@ -102,7 +102,7 @@ namespace MeshImporterPrivate
 	 * reported by the editor is the old one. Editing the description means everything downstream -
 	 * collision, bounds, lightmap packing - sees the mesh at the size it will actually be.
 	 */
-	static bool TransformGeometry(UStaticMesh* Mesh, float TargetSizeCm, bool bOriginAtBase, FVector& OutBoundsSize)
+	static bool TransformGeometry(UStaticMesh* Mesh, float TargetSizeCm, bool bOriginAtBase, bool bKeepAuthoredOrigin, FVector& OutBoundsSize)
 	{
 		if (Mesh == nullptr || !Mesh->IsMeshDescriptionValid(0))
 		{
@@ -155,6 +155,13 @@ namespace MeshImporterPrivate
 		if (bOriginAtBase)
 		{
 			Offset.Z = -Bounds.Min.Z;
+		}
+
+		// Unless the position is the point. A garment fitted around a character sits where the
+		// character is, and its origin is the character's - see the flag's own note.
+		if (bKeepAuthoredOrigin)
+		{
+			Offset = FVector::ZeroVector;
 		}
 
 		Mesh->ModifyMeshDescription(0);
@@ -261,6 +268,28 @@ FMeshImportOutcome FMeshImporter::Import(const FMeshImportRequest& Request)
 			MeshCount, *Mesh->GetName()));
 	}
 
+	// **Quads do not survive an FBX import, and no import setting changes that.** Interchange's FBX
+	// reader triangulates before it builds the mesh description - `if (!Mesh->IsTriangleMesh())
+	// Triangulate(...)`, with a `check(PolygonVertexCount == 3)` downstream - so a quad model arrives
+	// here as triangles however it was generated.
+	//
+	// Worth saying out loud because the option that asked for quads sits on the generator, is charged
+	// for, and leaves no trace in the editor: the wireframe shows triangles and reads as a request
+	// that was ignored. It also doubles the mesh - a face budget spent on quads becomes about twice
+	// as many triangles once they are split.
+	//
+	// The quads are not lost, only not in the asset. The downloaded file still has them, so the
+	// warning names it rather than describing where it might be.
+	if (FPaths::GetExtension(Request.AbsoluteArtifactPath).Equals(TEXT("fbx"), ESearchCase::IgnoreCase))
+	{
+		Outcome.Warnings.Add(FString::Printf(
+			TEXT("Unreal triangulates FBX on import and no import setting preserves quads, so if this "
+				 "model was generated with quad topology the asset is triangles, and its triangle count is "
+				 "roughly double the face budget that was asked for. The quads are intact in the file it "
+				 "was imported from - open that one to work on it: %s"),
+			*Request.AbsoluteArtifactPath));
+	}
+
 	FMeshImportOutcome Finished = Refinish(Mesh, Request.Finish, Request.NaniteTriangleThreshold);
 
 	Finished.Warnings.Append(Outcome.Warnings);
@@ -318,7 +347,7 @@ FMeshImportOutcome FMeshImporter::Refinish(
 	// ---------------------------------------------------------------------------------------------
 
 	if (!MeshImporterPrivate::TransformGeometry(
-			Mesh, Finish.TargetSizeCm, Finish.bOriginAtBase, Outcome.BoundsSize))
+			Mesh, Finish.TargetSizeCm, Finish.bOriginAtBase, Finish.bKeepAuthoredOrigin, Outcome.BoundsSize))
 	{
 		Outcome.Warnings.Add(
 			TEXT("Could not read the mesh geometry, so scale and pivot were left alone."));

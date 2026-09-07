@@ -10,6 +10,8 @@
 #include "AssetRegistry/IAssetRegistry.h"
 #include "Components/StaticMeshComponent.h"
 #include "Engine/StaticMesh.h"
+#include "Editor.h"
+#include "Subsystems/AssetEditorSubsystem.h"
 #include "MeshDescription.h"
 #include "Framework/MultiBox/MultiBoxBuilder.h"
 #include "HAL/FileManager.h"
@@ -685,6 +687,34 @@ void SMeshDefPreview::Construct(const FArguments& InArgs)
 					.OnGetMenuContent_Lambda([this]() { return BuildViewModeMenu(); })
 				]
 			]
+		]
+
+		+ SVerticalBox::Slot()
+		.AutoHeight()
+		[
+			SNew(SComboButton)
+			.Visibility_Lambda([this]() { const UMeshDef* Def = Definition.Get(); return Def && !Def->PostOutputs.IsEmpty() ? EVisibility::Visible : EVisibility::Collapsed; })
+			.ButtonContent()[ SNew(STextBlock).Text(LOCTEXT("PostOutputs", "Open post-processing output")) ]
+			.OnGetMenuContent_Lambda([this]() -> TSharedRef<SWidget>
+			{
+				FMenuBuilder Menu(true, nullptr);
+				const UMeshDef* Def = Definition.Get();
+				if (Def)
+				{
+					for (int32 Index = Def->PostOutputs.Num() - 1; Index >= 0; --Index)
+					{
+						const FMeshPostOutput& Output = Def->PostOutputs[Index];
+						const TSoftObjectPtr<UObject> Asset = Output.Asset;
+						Menu.AddMenuEntry(FText::FromString(Output.Step + TEXT(" - ") + Output.CreatedUtc.ToString()),
+							FText::FromString(Asset.ToString()), FSlateIcon(), FUIAction(FExecuteAction::CreateLambda([Asset]()
+							{
+								if (UObject* Object = Asset.LoadSynchronous())
+									GEditor->GetEditorSubsystem<UAssetEditorSubsystem>()->OpenEditorForAsset(Object);
+							})));
+					}
+				}
+				return Menu.MakeWidget();
+			})
 		]
 
 		+ SVerticalBox::Slot()

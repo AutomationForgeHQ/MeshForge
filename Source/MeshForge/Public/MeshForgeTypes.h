@@ -5,6 +5,8 @@
 #include "CoreMinimal.h"
 #include "MeshForgeTypes.generated.h"
 
+class USkeletalMesh;
+
 class UMeshDef;
 
 /** Where a definition is in its life. */
@@ -362,8 +364,19 @@ struct MESHFORGE_API FMeshFinishSettings
 	float TargetSizeCm = 0.f;
 
 	/** Put the origin on the base of the bounding box rather than its centre, so props sit on floors. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Finish")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Finish", meta = (EditCondition = "!bKeepAuthoredOrigin"))
 	bool bOriginAtBase = true;
+
+	/**
+	 * Leave the mesh exactly where its file put it. No re-centring, no origin at the base.
+	 *
+	 * For a mesh whose position *means* something: a garment fitted around a character is placed
+	 * relative to that character's origin, and moving it to its own bounds centre - the right
+	 * thing for every prop - drops the shirt at the character's feet. A post step that fits
+	 * something to something else turns this on for its result whatever the definition says.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Finish")
+	bool bKeepAuthoredOrigin = false;
 
 	// ---------------------------------------------------------------------------------------------
 	// LODs
@@ -431,6 +444,19 @@ struct MESHFORGE_API FMeshFinishSettings
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Textures")
 	bool bCorrectColourSpaces = true;
 
+};
+
+/** One immutable output from an individual post-processing step. */
+USTRUCT(BlueprintType)
+struct MESHFORGE_API FMeshPostOutput
+{
+	GENERATED_BODY()
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Output") FGuid StepId;
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Output") FString TakeId;
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Output") FString Step;
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Output") TSoftObjectPtr<UObject> Input;
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Output") TSoftObjectPtr<UObject> Asset;
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Output") FDateTime CreatedUtc;
 };
 
 /** One generated take. */
@@ -518,6 +544,10 @@ struct MESHFORGE_API FMeshImportOutcome
 
 	UPROPERTY(BlueprintReadOnly, Category = "Import")
 	TSoftObjectPtr<UStaticMesh> Mesh;
+
+	/** Set for native skeletal post-processing. Mesh remains the static output field. */
+	UPROPERTY(BlueprintReadOnly, Category = "Import")
+	TSoftObjectPtr<USkeletalMesh> SkeletalMesh;
 
 	UPROPERTY(BlueprintReadOnly, Category = "Import")
 	TArray<TSoftObjectPtr<UMaterialInterface>> Materials;

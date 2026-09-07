@@ -313,6 +313,20 @@ already.
 Estimates go through the same resolver as submissions, so the number an agent reads and the number
 the panel shows cannot disagree — they did, by a factor of two, until they shared one.
 
+## Individual post-processing steps
+
+Each step has **Run this step** and an **Input Source** setting:
+
+- **Previous step output** uses the latest saved result from the immediately preceding step. The first step uses the original mesh. A missing output blocks execution with an explanation; it never triggers a prerequisite run.
+- **Original mesh** uses the definition's Source Mesh, or its selected generated mesh when the step supports GLB input.
+- **Selected mesh / saved output** uses an explicit static mesh. **Choose saved output as input** lists historical static outputs, including takes created before per-step history existed. The asset picker also accepts meshes from other definitions.
+
+**Run chain** executes enabled steps. A previous-step connection uses fresh output when that predecessor is included in the run; otherwise it requires a saved output. Explicit inputs remain explicit during a chain run. Every completed step appends a separate output and records its input; earlier assets are preserved. Native skeletal steps must be last in a chain, but can be run individually.
+
+New outputs carry stable producer step IDs. Historical outputs are matched automatically only when there is a single producer of that class; ambiguous old results can still be selected explicitly.
+
+The editor tool `RunPostProcessing` accepts a zero-based `stepIndex` (`-1` runs the chain). `ListPostInputs` discovers saved outputs. Native output success is reported through `skeletalMesh` rather than `mesh`.
+
 ## Requires
 
 Unreal Engine 5.8, with Interchange's glTF support (on by default). Editor-only; nothing here

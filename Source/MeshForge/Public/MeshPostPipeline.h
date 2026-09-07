@@ -6,6 +6,17 @@
 #include "MeshForgePipeline.h"
 #include "MeshPostPipeline.generated.h"
 
+class UStaticMesh;
+class USkeletalMesh;
+
+UENUM(BlueprintType)
+enum class EMeshPostInputSource : uint8
+{
+	PreviousStep UMETA(DisplayName="Previous step output (original for first step)"),
+	OriginalMesh UMETA(DisplayName="Original mesh"),
+	SelectedMesh UMETA(DisplayName="Selected mesh / saved output")
+};
+
 /**
  * The mesh a post step is asked to work on, and everything known about where it came from.
  *
@@ -16,7 +27,7 @@
 struct MESHFORGE_API FMeshPostJob
 {
 	/**
-	 * The mesh itself, as glTF binary. Always filled, whatever the source.
+	 * The mesh itself, as glTF binary. Native asset-only steps may omit these bytes.
 	 *
 	 * Bytes rather than a path or a UStaticMesh, and the reason is the same one IMeshProvider gives
 	 * for images: the vendors want it three different ways - a public URL, a base64 data URI, a
@@ -56,6 +67,15 @@ struct MESHFORGE_API FMeshPostJob
 /** What one post step produced, or why it produced nothing. */
 struct MESHFORGE_API FMeshPostResult
 {
+	/** Frozen provenance for this individual step, captured from the worker copy. */
+	FString PipelineClass;
+	FString PipelineSignature;
+	FName PipelineProvider;
+	FString InputAssetPath;
+	FString VendorTaskId;
+	FGuid StepId;
+	bool bUsesPreviousOutput = true;
+	bool bNativeOutput = false;
 	/** The processed mesh, as glTF binary. This is what the next step in the chain is handed. */
 	TArray<uint8> MeshGlb;
 
@@ -80,7 +100,16 @@ struct MESHFORGE_API FMeshPostResult
 	/** A sentence for a person. Empty on success. */
 	FString Error;
 
-	bool IsOk() const { return Error.IsEmpty() && MeshGlb.Num() > 0; }
+	/**
+	 * The mesh is positioned relative to something else and must import exactly where it is.
+	 *
+	 * Set by a step that fits a mesh to a character. The import stage then keeps the file's
+	 * origin and leaves the size alone whatever the definition's finish says, because a finish
+	 * that re-centres props is right for every prop and wrong for every garment.
+	 */
+	bool bKeepPlacement = false;
+
+	bool IsOk() const { return Error.IsEmpty() && (bNativeOutput || MeshGlb.Num() > 0); }
 };
 
 /**
@@ -104,6 +133,22 @@ class MESHFORGE_API UMeshPostPipeline : public UMeshForgePipeline
 	GENERATED_BODY()
 
 public:
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Input")
+	EMeshPostInputSource InputSource = EMeshPostInputSource::PreviousStep;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Input", meta=(EditCondition="InputSource == EMeshPostInputSource::SelectedMesh", EditConditionHides))
+	TSoftObjectPtr<UStaticMesh> InputMesh;
+
+	/** Persistent producer identity; output links survive reordered or newly added steps. */
+	UPROPERTY() FGuid StepId;
+
+	/** Native skeletal output is finalized on the game thread after the preceding static output imports. */
+	virtual bool ProducesSkeletalMesh() const { return false; }
+	virtual USkeletalMesh* CreateSkeletalOutput(UStaticMesh* Input, const FString& AssetPath, FString& Error) const
+	{
+		Error = TEXT("This step does not create skeletal meshes.");
+		return nullptr;
+	}
 
 	/** Fixed by the class, so a post pipeline cannot be offered anywhere but the post stage. */
 	virtual EMeshPipelineKind GetKind() const override final { return EMeshPipelineKind::Post; }

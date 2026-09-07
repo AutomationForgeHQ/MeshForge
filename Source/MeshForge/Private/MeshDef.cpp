@@ -24,6 +24,8 @@ namespace MeshDefStages
 	{
 		if (Pipeline == nullptr)  { return TEXT("none|"); }
 		if (!Pipeline->bEnabled)  { return TEXT("off|"); }
+		if (const UMeshPostPipeline* Post = Cast<UMeshPostPipeline>(Pipeline))
+			return Post->Signature() + FString::Printf(TEXT("|input=%d:%s|"), int32(Post->InputSource), *Post->InputMesh.ToString());
 		return Pipeline->Signature() + TEXT("|");
 	}
 
@@ -177,6 +179,50 @@ FMeshCandidate* UMeshDef::FindCandidateByJobMutable(const FString& JobId)
 {
 	return Candidates.FindByPredicate(
 		[&JobId](const FMeshCandidate& Candidate) { return Candidate.JobId == JobId; });
+}
+
+void UMeshDef::PostLoad()
+{
+	Super::PostLoad();
+
+	// Nothing can be running: jobs live in the subsystem's memory and this asset has just been read
+	// off disk. Anything still claiming to run was interrupted, so say so rather than leave a lock
+	// nobody can pick.
+	int32 Healed = 0;
+
+	for (FMeshCandidate& Candidate : Candidates)
+	{
+		if (Candidate.Status == EMeshJobStatus::Pending || Candidate.Status == EMeshJobStatus::Running)
+		{
+			Candidate.Status = EMeshJobStatus::Cancelled;
+			++Healed;
+		}
+	}
+
+	for (TPair<EMeshStage, FMeshStageState>& Stage : Stages)
+	{
+		if (Stage.Value.Status == EMeshStageStatus::Running)
+		{
+			Stage.Value.Status = EMeshStageStatus::Failed;
+			Stage.Value.Error = TEXT("Interrupted - the editor closed while this was running.");
+			++Healed;
+		}
+	}
+
+	if (Status == EMeshDefStatus::Submitting || Status == EMeshDefStatus::Generating)
+	{
+		Status = EMeshDefStatus::Failed;
+		++Healed;
+	}
+
+	// The take itself is not lost even when this fires: every one is filed under Forge/Library with
+	// its artifact and a take.json before the asset is written, so a paid generation is re-importable.
+	if (Healed > 0)
+	{
+		UE_LOG(LogMeshForge, Warning,
+			TEXT("%s was saved while a job was in flight; cleared %d interrupted state(s). Any finished take is still in the Forge library."),
+			*GetName(), Healed);
+	}
 }
 
 bool UMeshDef::IsBusy() const

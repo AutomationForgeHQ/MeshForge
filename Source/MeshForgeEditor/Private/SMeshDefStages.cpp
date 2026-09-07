@@ -8,6 +8,8 @@
 #include "Engine/Texture2D.h"
 #include "PropertyCustomizationHelpers.h"
 #include "Misc/PackageName.h"
+#include "Misc/MessageDialog.h"
+#include "AssetRegistry/AssetRegistryModule.h"
 #include "Modules/ModuleManager.h"
 #include "PropertyEditorModule.h"
 #include "IDetailsView.h"
@@ -353,8 +355,8 @@ FText SMeshDefStages::ActionHint(EMeshStage Stage) const
 
 	case EMeshStage::Post:
 		return LOCTEXT("HintPost",
-			"Runs the chain over the chosen mesh - each step is handed what the one before it "
-			"produced - and files the result as its own take. The mesh it started from is kept.");
+			"Run chain executes enabled steps using their chosen inputs. Run this step uses an existing "
+			"input without running earlier steps. Every completed step creates a separate output.");
 
 	default:
 		return LOCTEXT("HintImport",
@@ -608,10 +610,6 @@ TSharedRef<SWidget> SMeshDefStages::BuildPostChain()
 
 			View = PropertyEditor.CreateDetailView(Args);
 
-		// Same reason as the post chain above: a refusal is structural, so the row is rebuilt when a
-		// setting changes rather than only when the stage runs.
-		View->OnFinishedChangingProperties().AddSP(this, &SMeshDefStages::OnPipelineEdited);
-
 			// **Rebuilt on every edit, so a rule that has just started applying is shown at once.** The
 			// status, summary and cost lines are bound attributes and update themselves, but whether a row
 			// draws a Run button or a refusal is decided when the row is built - so ticking "separate
@@ -621,6 +619,22 @@ TSharedRef<SWidget> SMeshDefStages::BuildPostChain()
 		}
 
 		View->SetObject(Step, /*bForceRefresh*/ true);
+		const TWeakObjectPtr<UMeshDef> WeakDef = Def;
+		const TWeakObjectPtr<UMeshPostPipeline> WeakStep = Step;
+		const auto CachedReason = MakeShared<TPair<double, FString>>(-1.0, FString());
+		auto Reason = [WeakDef, WeakStep, CachedReason]() -> FString
+		{
+			const double Now = FPlatformTime::Seconds();
+			if (Now - CachedReason->Key > 1.0)
+			{
+				CachedReason->Key = Now;
+				UMeshDef* D = WeakDef.Get();
+				UMeshForgeSubsystem* S = UMeshForgeSubsystem::Get();
+				CachedReason->Value = D && S ? S->PostStepBlockedReason(D, D->PostPipelines.IndexOfByKey(WeakStep.Get()))
+					: TEXT("The definition is unavailable.");
+			}
+			return CachedReason->Value;
+		};
 
 		Box->AddSlot().AutoHeight().Padding(0.0f, 4.0f, 0.0f, 0.0f)
 		[
@@ -645,6 +659,26 @@ TSharedRef<SWidget> SMeshDefStages::BuildPostChain()
 
 					+ SHorizontalBox::Slot().FillWidth(1.0f)
 
+					+ SHorizontalBox::Slot().AutoWidth().Padding(4.0f, 0.0f)
+					[
+						SNew(SButton)
+						.Text(LOCTEXT("RunOnlyPostStep", "Run this step"))
+						.IsEnabled_Lambda([Reason]() { return Reason().IsEmpty(); })
+						.ToolTipText_Lambda([Reason]() { const FString Why = Reason(); return FText::FromString(Why.IsEmpty()
+							? TEXT("Run only this step using its chosen input. Save the result as a separate output.") : Why); })
+						.OnClicked_Lambda([WeakDef, WeakStep]()
+						{
+							if (UMeshDef* D = WeakDef.Get())
+								if (UMeshForgeSubsystem* S = UMeshForgeSubsystem::Get())
+								{
+									FString Error;
+									if (!S->RunPostStep(D, D->PostPipelines.IndexOfByKey(WeakStep.Get()), Error).IsValid())
+										FMessageDialog::Open(EAppMsgType::Ok, FText::FromString(Error));
+								}
+							return FReply::Handled();
+						})
+					]
+
 					+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
 					[
 						SNew(SButton)
@@ -663,6 +697,43 @@ TSharedRef<SWidget> SMeshDefStages::BuildPostChain()
 				+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 4.0f, 0.0f, 0.0f)
 				[
 					View.ToSharedRef()
+				]
+				+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 4.0f)
+				[
+					SNew(SComboButton)
+					.ButtonContent()[SNew(STextBlock).Text(LOCTEXT("SavedPostInput", "Choose saved output as input…"))]
+					.OnGetMenuContent_Lambda([this, WeakDef, WeakStep]() -> TSharedRef<SWidget>
+					{
+						FMenuBuilder Menu(true, nullptr);
+						UMeshForgeSubsystem* S = UMeshForgeSubsystem::Get();
+						const auto Choices = S ? S->GetPostInputChoices(WeakDef.Get()) : TArray<FMeshPostOutput>();
+						int32 Count = 0;
+						for (const FMeshPostOutput& Output : Choices)
+						{
+							const FSoftObjectPath Path = Output.Asset.ToSoftObjectPath();
+							const auto Data = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get().GetAssetByObjectPath(Path);
+							if (Data.AssetClassPath != UStaticMesh::StaticClass()->GetClassPathName()) continue;
+							++Count;
+							Menu.AddMenuEntry(FText::FromString(FString::Printf(TEXT("%s | %s | %s"), *Output.Step,
+								*Output.CreatedUtc.ToString(), *Output.TakeId.Left(8))), FText::FromString(Path.ToString()), FSlateIcon(),
+								FUIAction(FExecuteAction::CreateLambda([this, WeakDef, WeakStep, Path]()
+								{
+									if (!WeakDef.IsValid() || !WeakStep.IsValid()) return;
+									const FScopedTransaction Transaction(LOCTEXT("SelectPostInput", "Select post-processing input"));
+									WeakDef->Modify(); WeakStep->Modify();
+									WeakStep->InputSource = EMeshPostInputSource::SelectedMesh;
+									WeakStep->InputMesh = TSoftObjectPtr<UStaticMesh>(Path);
+									WeakDef->MarkPackageDirty(); Refresh();
+								})));
+						}
+						if (!Count) Menu.AddMenuEntry(LOCTEXT("NoSavedPostInput", "No saved static outputs yet"), FText(), FSlateIcon(), FUIAction());
+						return Menu.MakeWidget();
+					})
+				]
+				+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 4.0f)
+				[
+					SNew(STextBlock).AutoWrapText(true)
+					.Text_Lambda([Reason]() { return FText::FromString(Reason()); })
 				]
 			]
 		];
@@ -826,7 +897,7 @@ FText SMeshDefStages::RunLabel(EMeshStage Stage) const
 	{
 	case EMeshStage::Concept: return LOCTEXT("RunDraw",     "Draw");
 	case EMeshStage::Mesh:    return LOCTEXT("RunGenerate", "Generate");
-	case EMeshStage::Post:    return LOCTEXT("RunPost",     "Run");
+	case EMeshStage::Post:    return LOCTEXT("RunPost",     "Run chain");
 	case EMeshStage::Import:  return LOCTEXT("RunImport",   "Import");
 	default:                  return LOCTEXT("RunStage",    "Run");
 	}

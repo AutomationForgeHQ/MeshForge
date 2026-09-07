@@ -191,7 +191,16 @@ public:
 	 * chain: carrying on would import a mesh that is missing a pass somebody paid for, and it would
 	 * look exactly like one that is not.
 	 */
-	FGuid StartPostProcessing(UMeshDef* Def, FString& OutError);
+	FGuid StartPostProcessing(UMeshDef* Def, FString& OutError, int32 OnlyStep = INDEX_NONE);
+
+	/** Run only this step, consuming its selected existing input. Never runs prerequisites. */
+	UFUNCTION(BlueprintCallable, Category="MeshForge|Post")
+	FGuid RunPostStep(UMeshDef* Definition, int32 StepIndex, FString& Error);
+
+	/** Includes historical static outputs discovered before per-step history was introduced. */
+	TArray<FMeshPostOutput> GetPostInputChoices(const UMeshDef* Def) const;
+	FString PostStepBlockedReason(const UMeshDef* Def, int32 StepIndex) const;
+	bool ResolvePostStepMesh(const UMeshDef* Def, int32 StepIndex, TSoftObjectPtr<UStaticMesh>& Mesh, FString& Error) const;
 
 	/**
 	 * The mesh a post chain would start from, as glTF bytes, plus where it came from.
@@ -402,11 +411,15 @@ private:
 	 * Files the result in the library before importing it, for the same reason a generated take is
 	 * filed before import: an import can fail and a paid pass must not be lost with it.
 	 */
-	void FinishPostRun(
+	bool FinishPostRun(
 		const FGuid& JobId,
 		const TArray<uint8>& Glb,
 		const TArray<FMeshPostResult>& Steps,
-		const FString& Error);
+		const FString& Error,
+		bool bCompleteJob = true);
+
+	void FinishPostChain(const FGuid& JobId, const TArray<UMeshPostPipeline*>& Pipelines,
+		const TArray<FMeshPostResult>& Results, const FString& Error, TSoftObjectPtr<UStaticMesh> Source);
 
 	/** Finish a job and write its result onto the definition. Game thread only. */
 	void FinishJob(const FGuid& JobId, bool bSuccess, const FString& Error);
