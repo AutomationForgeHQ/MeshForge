@@ -1,7 +1,7 @@
 {
   "FileVersion": 3,
   "Version": 2,
-  "VersionName": "0.2.0",
+  "VersionName": "0.2.1",
   "FriendlyName": "MeshForge",
   "Description": "Describe a prop or drop a reference image, generate it with an AI mesh provider, and get a game-ready static mesh imported with its textures, materials, collision and lightmap UVs. Owns one pipeline end to end - submit, poll, download, import, finish. Provider-agnostic: local runners and hosted services register through the same interface. Standalone: no gameplay framework dependency, no rigging, no skeletal meshes.",
   "Category": "Automation Forge",

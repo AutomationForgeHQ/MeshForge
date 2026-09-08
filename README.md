@@ -4,7 +4,7 @@ Describe a prop or drop a reference image, generate it with an AI mesh provider,
 game-ready static mesh in your project — with its textures, materials, collision, lightmap UVs and
 a pivot that sits on the floor.
 
-**Version 0.0.1. Experimental, and not yet released.**
+**Version 0.2.0. Beta.**
 
 ---
 
@@ -18,8 +18,9 @@ prompt / image  ->  provider  ->  glTF  ->  static mesh + materials + textures  
 
 It is **provider-agnostic**. MeshForge ships no generator of its own; every one is an add-on that
 registers through the same interface. Today that is
-[MeshForgeTrellis](../MeshForgeTrellis) — Microsoft's TRELLIS.2, running locally in Docker, free.
-Hosted services fit the same shape.
+[MeshForgeTrellis](https://kovati.dev/plugins/meshforge/) — Microsoft's TRELLIS.2, running locally in Docker, free —
+and [MeshForgeCloud](https://kovati.dev/plugins/meshforge/), which wires up hosted providers (Meshy, Tripo) on your own
+API key. Hosted services fit the same shape, and are already shipped, not just hypothetical.
 
 An empty provider list is therefore a normal state, not a fault, and the editor says so.
 
@@ -122,8 +123,9 @@ different collision without paying for generation twice.
 outstanding: *choosing* which pictures the generator sees works and is where most of the value is;
 *making more pictures to choose from* — background removal, extra angles — has no pipeline shipped
 yet. On a provider whose image endpoint already removes backgrounds and draws multiple views, that
-half is unnecessary rather than missing. Post is designed, its settings save, and its Run button
-says so rather than appearing to work.
+half is unnecessary rather than missing. Post, by contrast, is built and runs: steps execute
+individually or as a chain, each with its own input source, and the shipped pipelines are Meshy and
+Tripo retexture plus MeshForgeGarment's fit and skinning steps.
 
 ### Nothing blocks the editor
 
@@ -147,7 +149,7 @@ and that is what the stage status is for.
 
 ### The panel
 
-Four tabs. **Stages** carries a proper multi-line prompt editor and, on each stage that takes one
+Five tabs. **Stages** carries a proper multi-line prompt editor and, on each stage that takes one
 pipeline, that pipeline's own settings inline — choosing the local image pipeline puts a model, a
 size and a step count on the row; choosing the Meshy one replaces them with a model, an aspect ratio
 and a pose. Neither list is written in the panel. Both come from the same reflected properties an
@@ -198,9 +200,9 @@ details panel and the agent option list are generated from the same declaration 
 |---|---|---|
 | Image | `Image - Local (this machine's GPU)` | 106s cold, 23s warm, free |
 | Image | `Image - Meshy (nano-banana)` | 19s, 3 credits |
-| Mesh | `Meshy - Standard (meshy-7)`, `Meshy - Smart Topology (T2)` | wired, priced, unspent |
+| Mesh | `Meshy - Standard (meshy-7)`, `Meshy - Smart Topology (T2)` | measured — 1,943,800 triangles for 30 credits, 6,275 for 15 |
 | Refine | — | |
-| Post | — | |
+| Post | `MeshyRetexturePipeline`, `TripoRetexturePipeline`; MeshForgeGarment adds fit/skinning steps | |
 
 **An image pipeline does its own work, and that is a deliberate exception.** Everywhere else a
 pipeline declares and a provider acts. A provider interface can only carry what every provider has
@@ -296,7 +298,7 @@ Split three ways, by who owns the answer:
 
 ## For agents
 
-[MeshForgeToolset](../MeshForgeToolset) exposes the pipeline through the Unreal toolset registry:
+[MeshForgeToolset](https://github.com/AutomationForgeHQ/MeshForgeToolset) exposes the pipeline through the Unreal toolset registry:
 list providers, author definitions, list and set pipelines, draw concept images, list and choose
 pictures, estimate, generate, import, re-finish, and list what is running. It is a thin adapter —
 deleting it changes nothing about MeshForge.
