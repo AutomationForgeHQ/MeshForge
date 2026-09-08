@@ -4,7 +4,7 @@ Describe a prop or drop a reference image, generate it with an AI mesh provider,
 game-ready static mesh in your project — with its textures, materials, collision, lightmap UVs and
 a pivot that sits on the floor.
 
-**Version 0.2.0. Beta.**
+**Version 0.2.1. Beta.**
 
 ---
 
