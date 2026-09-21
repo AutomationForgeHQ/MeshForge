@@ -74,16 +74,21 @@ what Unreal does afterwards.
 
 ### What lands
 
-Everything one prop needs, in one folder named after it:
+Everything one definition makes, in one folder named after it, under the output root set in
+**Project Settings > Plugins > MeshForge**:
 
 ```
-/Game/_Generated/Mesh/Meshes/MSD_AmmoCrate/
-    StaticMeshes/SM_AmmoCrate     collision, lightmap UVs, Nanite decided, sized, pivot on the base
-    Materials/…                   PBR, from the glTF
-    Textures/…                    base colour, roughness, metallic
+/Game/_Generated/Mesh/Definitions/MSD_AmmoCrate_Generated/
+    Images/…              every picture drawn or added for it
+    References/…          pictures a reference step made from other pictures
+    Mesh/<take id>/…      one generated take: the static mesh (collision, lightmap UVs, Nanite
+                          decided, sized, pivot on the base), its materials and its textures
+    Post/<take id>/…      one post-processed take, a folder per step run
 ```
 
-Deleting a prop is deleting a folder, and regenerating replaces in place rather than accumulating.
+**Each take gets its own folder**, so a second take can never share, or silently keep, the first
+one's materials. Takes accumulate on purpose — they cost money — and deleting a prop is still
+deleting one folder.
 
 ## What it produces
 
@@ -217,6 +222,11 @@ anybody asks of a reference — is this worth reconstructing from — so it is n
 so a generated prop is judged under the lighting everything else is judged under. Viewer on the
 left, controls on the right.
 
+**Takes** is every take the definition has ever produced, read from the library on disk rather than
+from the definition — so a take somebody removed from the list to tidy it is still there, with its
+prompt and its price, and can be imported again. The columns are the questions people ask, in the
+order they ask them: when, what made it, how big, how long, what it cost.
+
 **Settings** is the whole asset as a details panel, in pipeline order. That order is set explicitly
 by a details customization, because Unreal does not sort categories by declaration order and reading
 `1 Concept, Prompt, 3 Mesh, 5 Import, 2 References, 4 Post` is worse than reading nothing.
@@ -252,11 +262,12 @@ details panel and the agent option list are generated from the same declaration 
 
 | Kind | Ships today | Proven |
 |---|---|---|
-| Image | `Image - Local (this machine's GPU)` | 106s cold, 23s warm, free |
-| Image | `Image - Meshy (nano-banana)` | 19s, 3 credits |
-| Mesh | `Meshy - Standard (meshy-7)`, `Meshy - Smart Topology (T2)` | measured — 1,943,800 triangles for 30 credits, 6,275 for 15 |
+| Image | `Image - Local (this machine's GPU)` (MeshForgeTrellis) | 106s cold, 23s warm, free |
+| Image | `Image - Meshy (nano-banana, GPT Image)`, `Image - Tripo API v3`, `Image - Tripo multi-view (4 angles)` (MeshForgeCloud) | nano-banana: 19s, 3 credits |
+| Mesh | `Meshy - Standard (high quality)`, `Meshy - Smart lowpoly (T2)`, `Tripo - Photoreal (H3)`, `Tripo - Game ready (P2/P1)` (MeshForgeCloud) | measured on meshy-7 — 1,943,800 triangles for 30 credits; 6,275 for 15 on Smart lowpoly |
+| Mesh | TRELLIS.2 (MeshForgeTrellis) — chosen as a provider, with its settings and no pipeline class | |
 | Refine | — | |
-| Post | `MeshBlenderEditPipeline`, `MeshyRetexturePipeline`, `TripoRetexturePipeline`; MeshForgeGarment adds fit/skinning steps, NP_Clothing adds a clothing item step | |
+| Post | `Edit in Blender - round trip` (MeshForge), `Meshy - retexture`, `Tripo - retexture` (MeshForgeCloud); MeshForgeGarment adds `Garment fit`, `Wardrobe skinning` and `Sculpt mesh - in the editor`, NP_Clothing adds a clothing item step | |
 
 **An image pipeline does its own work, and that is a deliberate exception.** Everywhere else a
 pipeline declares and a provider acts. A provider interface can only carry what every provider has
@@ -280,7 +291,7 @@ the topology from a third.
 
 ## Every generated picture becomes an asset
 
-Images are ingested as real `UTexture2D`s in `/Game/_Generated/Mesh/Images/<Definition>/`, appended
+Images are ingested as real `UTexture2D`s in the definition's own `Images/` folder, appended
 rather than replacing — two runs are two candidates, and on a provider with no seed a discarded one
 cannot be drawn again.
 
@@ -308,10 +319,13 @@ changes, and refusing on another provider's key would break simply switching one
 
 ## What it deliberately does not do
 
-- **No rigging, and no skeletal meshes.** A generated character comes back as one watertight
-  surface with no skeleton and no part decomposition. Useful as a statue or a background figure;
-  not an animated character. Pretending otherwise would mean a half-working skeletal path that is
-  wrong for the props this is actually for.
+- **No rigging.** A generated character comes back as one watertight surface with no skeleton and
+  no part decomposition. Useful as a statue or a background figure; not an animated character.
+  Pretending otherwise would mean a half-working skeletal path that is wrong for the props this is
+  actually for. What MeshForge generates is always a static mesh. A post step from an add-on can
+  skin one — MeshForgeGarment's wardrobe skinning binds a garment to a character's skeleton — and
+  MeshForge then keeps, shows and can round-trip that skinned result through Blender, but it never
+  makes a skeleton itself.
 - **No level placement.** Dragging a finished mesh into a level is a person's job.
 
 ## Using it
@@ -322,9 +336,8 @@ changes, and refusing on another provider's key would break simply switching one
    provider's capabilities first — some generate from text, some only from an image.
 4. Generate. The first successful take is imported and finished automatically.
 
-Everything one prop needs — the mesh, its materials, its textures — lands in a single folder named
-after it. That is deliberate: deleting a prop is deleting a folder, and it is the only layout in
-which regenerating *replaces* the old assets instead of piling new ones beside them.
+Everything one definition makes lands in a single folder named after it, with a folder per take
+inside — see [What lands](#what-lands). Deleting a prop is deleting that folder.
 
 You can also finish a glTF you already have, with no provider and no GPU — useful for a mesh from a
 web tool, a scan, or a colleague:
@@ -336,8 +349,12 @@ MeshForge.ImportFile C:/path/to/thing.glb SM_Thing
 Console commands:
 
 ```
-MeshForge.ListProviders     what is installed, and whether each can generate right now
-MeshForge.TestConnection    check one provider
+MeshForge.ListProviders       what is installed, and whether each can generate right now
+MeshForge.TestConnection      check one provider (optional argument: its id)
+MeshForge.RebuildThumbnails   regenerate and save every Mesh Definition's Content Browser thumbnail
+                              (optional argument: a content folder, default /Game)
+MeshForge.VerifyStageHashes   report definitions whose stages were saved ready but whose inputs now
+                              hash differently (optional argument: a content folder)
 ```
 
 ## Settings
@@ -347,7 +364,7 @@ Split three ways, by who owns the answer:
 | Where | What |
 |---|---|
 | **Project Settings > Plugins > MeshForge** | Output paths, the default provider, the default workflow, quality and finish defaults. Committed; the team shares them. |
-| **Editor Preferences > Automation Forge > MeshForge** | Which provider *I* use, and the field that accepts my key. Never committed. |
+| **Editor Preferences > Automation Forge > MeshForge** | Which provider *I* use, where Blender is for *Edit in Blender*, and whether the Mesh tab shows a floor. Never committed. A provider's key is entered on that provider's own preferences page or on the Automation Forge Keys page. |
 | The OS credential vault | Secrets. Never in any `.ini`. |
 
 ## For agents
