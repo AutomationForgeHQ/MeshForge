@@ -1160,6 +1160,15 @@ FText SMeshDefImages::SelectionSummary() const
 
 	const TSoftObjectPtr<UTexture2D> Main = Def->ResolveMainImage();
 
+	// Checked before anything is said about what the generator is shown, because in this case it is
+	// shown nothing - and "the mesh stage has no picture" reads as a fault when words are the input.
+	if (Def->GetMeshInput() == EMeshPipelineInput::Text)
+	{
+		return LOCTEXT("SummaryTextOnly",
+			"The generator is set to build from words, so none of these pictures is sent. Set its type "
+			"back to a picture on the Mesh stage to use them.");
+	}
+
 	if (Main.IsNull())
 	{
 		return LOCTEXT("NothingChosen", "Nothing chosen yet - the mesh stage has no picture to work from.");

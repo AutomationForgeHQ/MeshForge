@@ -12,6 +12,7 @@
 
 class UStaticMesh;
 class UTexture2D;
+class UMeshWorkflow;
 
 /**
  * The editable, regenerable unit of the pipeline - one asset per prop.
@@ -46,18 +47,92 @@ public:
 	// ---------------------------------------------------------------------------------------------
 
 	/**
-	 * What the object is.
+	 * The brief a new image or mesh pipeline starts from. Not shown anywhere.
 	 *
-	 * Feeds the concept stage, and on a provider that generates from text it is the whole brief.
-	 * First because it is the field with the most effect on the result and the one people rewrite
-	 * most often - the panel gives it its own box above the stages for the same reason.
+	 * **Prompts belong to the pipelines that read them** (UMeshForgePipeline::Prompt): the picture's
+	 * words on the concept pipeline, the mesh generator's on the mesh pipeline, a retexture's on its
+	 * step. This field is what a pipeline set on this definition starts from when the pipeline it
+	 * replaces had no prompt - it is what an agent's CreateMeshDefinition writes - and it holds the one
+	 * prompt every definition had before 2026-09-19, which PostLoad copied into its pipelines once.
 	 *
-	 * Describe the object, not the picture: "a dented steel ammunition crate with rope handles" is a
-	 * prop, "a photo of a crate on a white background, studio lighting" is a photograph of one, and
-	 * the second phrasing puts the studio in the mesh.
+	 * Also the stage hash's anchor: a pipeline's prompt is hashed only where it differs from this, so
+	 * the move changed no stored hash.
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Prompt", meta = (MultiLine = true))
+	UPROPERTY(BlueprintReadWrite, Category = "Prompt")
 	FString Prompt;
+
+	/** Set once PostLoad has copied Prompt into this definition's pipelines. Never cleared. */
+	UPROPERTY()
+	bool bPromptOnPipelines = false;
+
+	/** The words the mesh stage sends: its generator pipeline's prompt, or Prompt where there is no pipeline. */
+	FString GetMeshPrompt() const;
+
+	/** What the mesh stage builds from: its enabled generator pipeline's choice, or Either where there is none. */
+	EMeshPipelineInput GetMeshInput() const;
+
+	/** What the object is, for a step that wants a name for it: the mesh prompt, else the picture's, else Prompt. */
+	FString GetBrief() const;
+
+	/**
+	 * Give a pipeline just set on a stage the prompt of the one it replaces, or Fallback when that had
+	 * none. Prompts are what is being made, not how, so switching provider must not lose them.
+	 */
+	static void CarryPrompt(const UMeshForgePipeline* From, UMeshForgePipeline* To, const FString& Fallback);
+
+	// ---------------------------------------------------------------------------------------------
+	// Workflow - which stages this definition uses
+	// ---------------------------------------------------------------------------------------------
+
+	/**
+	 * Which of the five stages this definition uses. All on by default.
+	 *
+	 * Set by a Mesh Workflow, or by hand with the switches at the top of the Stages tab. A stage that is
+	 * off disappears from the panel and is refused rather than run - see FMeshStageSwitches.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "0 Workflow")
+	FMeshStageSwitches StageSwitches;
+
+	/**
+	 * Whether a stage is part of this definition.
+	 *
+	 * Its switch, and for the three stages that make a mesh, also "no Source Mesh": a definition given a
+	 * mesh to work on has never generated one, and that rule predates the switches. It is applied here
+	 * when read rather than written into old assets when they load.
+	 */
+	UFUNCTION(BlueprintPure, Category = "0 Workflow")
+	bool IsStageEnabled(EMeshStage Stage) const;
+
+	/** A sentence saying a stage is off and how to turn it on, or empty when it is on. */
+	FString DescribeDisabledStage(EMeshStage Stage) const;
+
+	/**
+	 * The Mesh Workflow this definition was last set up from. Empty is a definition set up by hand.
+	 *
+	 * A record, not a link: the workflow's contents were copied in when it was applied, and editing the
+	 * workflow later changes nothing here until it is reapplied.
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "0 Workflow")
+	TSoftObjectPtr<UMeshWorkflow> Workflow;
+
+	/**
+	 * Set this definition up from a workflow: its stage switches, pipelines, post steps and - where the
+	 * workflow says so - finish settings, copied in. Prompts (carried onto the new pipelines), pictures, Source Mesh, takes and outputs are
+	 * never touched.
+	 *
+	 * **Reapplying keeps history.** A post step at the same position and of the same kind as the one it
+	 * replaces keeps that step's id, so the outputs it made stay linked to it.
+	 *
+	 * @param OutNotes Sentences about slots that could not be filled - a preset from a plugin not installed.
+	 * @return False with a sentence in OutError when nothing was applied.
+	 */
+	bool ApplyWorkflow(const UMeshWorkflow* InWorkflow, TArray<FString>& OutNotes, FString& OutError);
+
+	/**
+	 * What differs between this definition and the workflow it was applied from, one line each. Empty
+	 * when it matches, or when it has no workflow.
+	 */
+	TArray<FString> DescribeWorkflowChanges() const;
 
 	// ---------------------------------------------------------------------------------------------
 	// Stage 1 - concept image
@@ -429,6 +504,19 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "6 State")
 	void RefreshStaleness();
+
+	/**
+	 * Why the post step at From cannot move to To, or empty when it can: out of range, or an order the
+	 * chain would refuse to run (see UMeshPostPipeline::ChainOrderProblem).
+	 */
+	FString PostStepMoveProblem(int32 From, int32 To) const;
+
+	/**
+	 * Move a post step to another position. The Post stage goes stale, because order changes what the
+	 * chain produces; every output is kept. Wrap it in a transaction for undo. False with the reason
+	 * when the move is refused.
+	 */
+	bool MovePostStep(int32 From, int32 To, FString& OutError);
 
 	/**
 	 * Heal a definition that was saved while a job was in flight.

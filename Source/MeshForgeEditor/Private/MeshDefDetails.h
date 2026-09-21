@@ -5,8 +5,12 @@
 #include "CoreMinimal.h"
 #include "IDetailCustomization.h"
 
+class IPropertyUtilities;
+class UMeshDef;
+
 /**
- * Orders a mesh definition's details categories to match the stages beside them.
+ * Orders a mesh definition's details categories to match the stages beside them, and hides the
+ * categories of stages the definition has switched off.
  *
  * **This exists because declaration order does not decide category order, despite looking as
  * though it does.** Unreal assigns each category a sort order of its own, and the result for this
@@ -18,14 +22,23 @@
  * named - which is the right default for one added later, since appearing at the bottom is a
  * smaller surprise than appearing between the concept image and the references.
  *
- * Nothing else is customised. The properties draw themselves from their own metadata, and a
- * customization that started rewriting rows would be a second description of this asset to keep in
- * step with the first.
+ * A switched-off stage's category is hidden, as its row is in the Stages tab, so the two tabs show the
+ * same definition. Otherwise the properties draw themselves from their own metadata.
  */
 class FMeshDefDetails : public IDetailCustomization
 {
 public:
 	static TSharedRef<IDetailCustomization> MakeInstance();
 
+	virtual ~FMeshDefDetails() override;
+
 	virtual void CustomizeDetails(IDetailLayoutBuilder& DetailBuilder) override;
+
+private:
+	/** Rebuild the layout when this definition's switches change - from this tab or from the Stages tab. */
+	void OnAnyPropertyChanged(UObject* Object, struct FPropertyChangedEvent& Event);
+
+	TWeakObjectPtr<UMeshDef> Definition;
+	TWeakPtr<IPropertyUtilities> Utilities;
+	FDelegateHandle PropertyChangedHandle;
 };

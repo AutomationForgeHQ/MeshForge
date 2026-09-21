@@ -33,6 +33,7 @@ public class MeshForgeEditor : ModuleRules
 				"AssetRegistry",        // finding the pipeline assets a stage may be pointed at
 				"ContentBrowser",       // "show me this in the browser", from the image grid
 				"RenderCore",
+				"RHI",                  // GMaxRHIShaderPlatform, to finish a thumbnail subject's shaders
 				"MeshDescription",
 			}
 			);

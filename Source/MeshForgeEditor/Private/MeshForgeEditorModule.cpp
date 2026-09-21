@@ -4,9 +4,12 @@
 #include "MeshPipelineDetails.h"
 #include "MeshDef.h"
 #include "MeshForgePipeline.h"
+#include "MeshDefThumbnailRenderer.h"
 
 #include "Modules/ModuleManager.h"
 #include "PropertyEditorModule.h"
+#include "ThumbnailRendering/ThumbnailManager.h"
+#include "UObject/Package.h"
 
 /**
  * MeshForge's editor presentation.
@@ -18,6 +21,8 @@
  *
  * The second customization shows a mesh pipeline which pictures it will be handed - read-only,
  * because choosing them stays in the Images tab where the gallery is.
+ *
+ * And a thumbnail renderer, so a definition's Content Browser tile shows its mesh or its main image.
  */
 class FMeshForgeEditorModule : public IModuleInterface
 {
@@ -38,7 +43,13 @@ public:
 		PropertyEditor.RegisterCustomClassLayout(
 			UMeshForgePipeline::StaticClass()->GetFName(),
 			FOnGetDetailCustomizationInstance::CreateStatic(&FMeshPipelineDetails::MakeInstance));
+
+		// A definition's tile shows what it made, or the picture it is made from, instead of the class icon.
+		UThumbnailManager::Get().RegisterCustomRenderer(UMeshDef::StaticClass(), UMeshDefThumbnailRenderer::StaticClass());
+		PackageDirtiedHandle = UPackage::PackageMarkedDirtyEvent.AddStatic(&UMeshDefThumbnailRenderer::MarkThumbnailStale);
 	}
+
+	FDelegateHandle PackageDirtiedHandle;
 
 	virtual void ShutdownModule() override
 	{
@@ -47,6 +58,13 @@ public:
 		{
 			PropertyEditor->UnregisterCustomClassLayout(UMeshDef::StaticClass()->GetFName());
 			PropertyEditor->UnregisterCustomClassLayout(UMeshForgePipeline::StaticClass()->GetFName());
+		}
+
+		UPackage::PackageMarkedDirtyEvent.Remove(PackageDirtiedHandle);
+
+		if (UObjectInitialized())
+		{
+			UThumbnailManager::Get().UnregisterCustomRenderer(UMeshDef::StaticClass());
 		}
 	}
 };

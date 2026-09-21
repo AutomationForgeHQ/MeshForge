@@ -87,7 +87,7 @@ public:
 	 */
 	FMeshControl ResolveControl(const UMeshDef* Def, FString& OutModelId) const;
 
-	/** True when this definition has a picture to generate from, wherever it came from. */
+	/** True when this definition has a picture to generate from, wherever it came from, and its generator sends pictures. */
 	bool HasReferenceImage(const UMeshDef* Def) const;
 
 	/** Extra views this definition's provider will actually read. Zero on a single-view model. */
@@ -197,23 +197,77 @@ public:
 	UFUNCTION(BlueprintCallable, Category="MeshForge|Post")
 	FGuid RunPostStep(UMeshDef* Definition, int32 StepIndex, FString& Error);
 
+	/**
+	 * Regenerate and save the Content Browser thumbnail of every Mesh Definition under a folder.
+	 *
+	 * The repair for definitions saved before their thumbnail could be drawn - an empty checkerboard
+	 * tile, or the class icon - and a way to refresh a whole folder at once. Loads each definition and
+	 * the mesh or image it shows, so a folder of heavy meshes takes a while. Returns one line saying how
+	 * many were drawn, how many have nothing to show yet, and which rendered empty.
+	 */
+	UFUNCTION(BlueprintCallable, Category="MeshForge")
+	FString RebuildDefinitionThumbnails(const FString& Folder);
+
+	// --- steps a person finishes ---------------------------------------------------------------------
+
+	/** True while this step is waiting for somebody to finish it - in Blender, say. */
+	bool IsWaitingForInteractive(const UMeshDef* Def, int32 StepIndex) const;
+
+	/**
+	 * True when this step has a result waiting that nothing is watching for: sent back after the editor
+	 * was closed and reopened, or after waiting was stopped.
+	 */
+	bool HasUnclaimedInteractiveResult(const UMeshDef* Def, int32 StepIndex) const;
+
+	/** Import that result as the step's output. The chain does not continue; run the next step yourself. */
+	FGuid PickUpInteractiveResult(UMeshDef* Def, int32 StepIndex, FString& OutError);
+
+	/**
+	 * Stop waiting on this definition's interactive step. Whatever it opened stays open, and a result
+	 * sent from it later can still be picked up from the step.
+	 */
+	void StopWaitingForInteractive(UMeshDef* Def);
+
+	/**
+	 * Send one command to this step's session - the one the chain is waiting on, or else the last one the
+	 * step started. False with a sentence when there is no session or the step could not do it.
+	 */
+	bool SendInteractiveCommand(const UMeshDef* Def, int32 StepIndex, const FString& Command, FString& OutReply) const;
+
 	/** Includes historical static outputs discovered before per-step history was introduced. */
 	TArray<FMeshPostOutput> GetPostInputChoices(const UMeshDef* Def) const;
+
+	/** Every recorded run of one step, newest first, whose asset still exists. */
+	TArray<FMeshPostOutput> GetStepOutputs(const UMeshDef* Def, const FGuid& StepId) const;
+
+	/** One run of a step by take id, or its newest when TakeId is empty. False when there is none. */
+	bool FindStepOutput(const UMeshDef* Def, const FGuid& StepId, const FString& TakeId, FMeshPostOutput& OutOutput) const;
 	FString PostStepBlockedReason(const UMeshDef* Def, int32 StepIndex) const;
-	bool ResolvePostStepMesh(const UMeshDef* Def, int32 StepIndex, TSoftObjectPtr<UStaticMesh>& Mesh, FString& Error) const;
+	/**
+	 * The asset a step would start from, before anything runs.
+	 *
+	 * A static mesh for a step that works on geometry. For a native step, whatever it accepts: a
+	 * skeletal wardrobe mesh, say, for a step that turns one into an inventory item. Null with no error
+	 * means "the definition's generated take", which only a geometry step can read.
+	 */
+	bool ResolvePostStepMesh(const UMeshDef* Def, int32 StepIndex, TSoftObjectPtr<UObject>& Mesh, FString& Error) const;
 
 	/**
 	 * The mesh a post chain would start from, as glTF bytes, plus where it came from.
 	 *
 	 * Game thread only - it can load an asset and run the exporter. Returns false with a sentence
 	 * saying which of the two routes was missing.
+	 *
+	 * TakeId names a generated take by MeshId, for a step pointed at one take of the Mesh stage. Empty
+	 * reads the take selected in the Takes tab. A Source Mesh wins either way.
 	 */
 	bool ResolvePostInput(
 		UMeshDef* Def,
 		TArray<uint8>& OutGlb,
 		FName& OutProviderId,
 		FString& OutTaskId,
-		FString& OutError) const;
+		FString& OutError,
+		const FString& TakeId = FString()) const;
 
 	FOnMeshForgeJobsChanged OnJobsChanged;
 
@@ -420,6 +474,49 @@ private:
 
 	void FinishPostChain(const FGuid& JobId, const TArray<UMeshPostPipeline*>& Pipelines,
 		const TArray<FMeshPostResult>& Results, const FString& Error, TSoftObjectPtr<UStaticMesh> Source);
+
+	/** Run exactly these post steps, in this order. What StartPostProcessing and a continuation share. */
+	FGuid StartPostSteps(UMeshDef* Def, const TArray<int32>& Requested, FString& OutError);
+
+	/**
+	 * Steps still to run once a job finishes, keyed by that job.
+	 *
+	 * A chain with a step a person finishes is run in pieces: the steps before it, then that step, then
+	 * the rest once its result is back. The rest waits here.
+	 */
+	TMap<FGuid, TArray<int32>> PostContinuations;
+
+	/** Start the rest of a chain on the next tick, so it never runs inside the import that ended the last piece. */
+	void ContinuePostChain(UMeshDef* Def, const TArray<int32>& Rest);
+
+	/** One interactive step waiting for a person. */
+	struct FInteractiveWait
+	{
+		FGuid JobId;
+		TWeakObjectPtr<UMeshDef> Definition;
+		TWeakObjectPtr<UMeshPostPipeline> Step;
+		FMeshPostInteractiveSession Session;
+		TArray<int32> Continuation;
+		double StartedSeconds = 0.0;
+	};
+
+	TArray<FInteractiveWait> InteractiveWaits;
+	FTSTicker::FDelegateHandle InteractiveHandle;
+
+	/** Export the step's input into a new session folder and hand it to the step. */
+	FGuid BeginInteractiveStep(UMeshDef* Def, int32 StepIndex, const TArray<int32>& Continuation, FString& OutError);
+
+	/** Add a job for a session and start watching it. */
+	FGuid WaitForInteractive(UMeshDef* Def, int32 StepIndex, const FMeshPostInteractiveSession& Session,
+		const TArray<int32>& Continuation);
+
+	bool PollInteractiveSteps(float DeltaTime);
+
+	/** Bring a finished session's result in as the step's output. */
+	void FinishInteractiveStep(const FInteractiveWait& Wait, const FString& ResultGlb, const FString& Summary);
+
+	/** Read a session folder back from disk, for picking up a result after a restart. */
+	static bool LoadInteractiveSession(const FString& Directory, FMeshPostInteractiveSession& OutSession);
 
 	/** Finish a job and write its result onto the definition. Game thread only. */
 	void FinishJob(const FGuid& JobId, bool bSuccess, const FString& Error);

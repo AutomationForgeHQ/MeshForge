@@ -7,10 +7,15 @@
 #include "EditorViewportClient.h"
 #include "SEditorViewport.h"
 #include "AdvancedPreviewScene.h"
+#include "MeshDefPreviewExtension.h"
 
 class UMeshDef;
 class UStaticMesh;
 class UStaticMeshComponent;
+class USkeletalMesh;
+class USkeletalMeshComponent;
+class UMeshComponent;
+class USceneComponent;
 class SMeshCompareWipe;
 
 /**
@@ -54,8 +59,8 @@ class FMeshDefPreviewClient : public FEditorViewportClient
 public:
 	FMeshDefPreviewClient(FAdvancedPreviewScene& InScene, const TSharedRef<SEditorViewport>& InViewport);
 
-	/** Put the camera where the whole mesh is visible, whatever size it is. */
-	void FrameMesh(UStaticMeshComponent* Component);
+	/** Put the camera where the whole of this is visible, whatever size it is. */
+	void FrameMesh(UPrimitiveComponent* Component);
 
 	/**
 	 * The same, from bounds given rather than read.
@@ -139,13 +144,21 @@ public:
 	/**
 	 * Show this mesh, or nothing when it is null.
 	 *
+	 * A UStaticMesh or a USkeletalMesh; anything else shows nothing. **Both, because a garment
+	 * stops being a static mesh halfway through its own chain.** The skinning step turns the
+	 * wrapped shirt into a skeletal mesh, and a viewer that only knew about static meshes could
+	 * show every take of that garment except the finished one.
+	 *
 	 * `bFrame` off leaves the camera alone, which is what the compare mode wants: it frames both
 	 * meshes together afterwards, and a re-frame per side would leave whichever was set last
 	 * deciding where the shared camera sits.
 	 */
-	void SetMesh(UStaticMesh* Mesh, bool bFrame = true);
+	void SetMesh(UObject* Mesh, bool bFrame = true);
 
-	UStaticMesh* GetMesh() const;
+	UObject* GetMesh() const;
+
+	/** The component drawing it: static or skeletal, or null when nothing is shown. */
+	UMeshComponent* GetMeshComponent() const;
 
 	/**
 	 * Where the subject sits and how big it is drawn.
@@ -160,8 +173,61 @@ public:
 
 	TSharedPtr<FMeshDefPreviewClient> GetClient() const { return Client; }
 
-	/** Triangles, vertices, materials and bounds of what is on screen, for the strip beneath it. */
-	FText DescribeMesh() const;
+	/** Show or hide the preview scene's floor, in this viewer only - never in the shared preview profile. */
+	void SetFloorVisible(bool bVisible);
+
+	/**
+	 * Draw these beside the subject on behalf of one extension, replacing that extension's last set.
+	 *
+	 * Held here rather than by the extension because the preview scene, the registration and the GC
+	 * root all belong to this viewport, and an extension that owned any of the three would have to
+	 * be told when the viewport goes away. It is told nothing: the components simply stop existing
+	 * with the viewport that drew them.
+	 */
+	void SetCompanions(FName ExtensionId, const TArray<USceneComponent*>& Components);
+
+	/**
+	 * Take every extension's companions out, whoever put them there.
+	 *
+	 * For the viewport that goes dark when the A/B seam is put away: it stops being a side, so
+	 * nothing asks it for companions again, and without this it would keep drawing the character
+	 * it had - invisibly, and back on screen the moment somebody compared two takes of something
+	 * else entirely.
+	 */
+	void ClearCompanions();
+
+	/**
+	 * Everything on screen, in world space: the subject where its transform puts it, and every
+	 * companion beside it.
+	 *
+	 * What framing has to use once a character is standing behind a shirt - framing the shirt alone
+	 * would put the head and the knees off screen, which is the one thing the character was added
+	 * to show.
+	 */
+	FBoxSphereBounds GetVisibleBounds() const;
+
+	/**
+	 * Keeps a hidden floor hidden.
+	 *
+	 * The preview scene re-applies the shared asset viewer profile - floor on - whenever any asset viewer
+	 * setting is broadcast, which happens while the editor is still opening. Hiding the floor once at
+	 * construction was therefore undone before the panel was first seen, and it only stayed hidden after
+	 * the checkbox was toggled on and off again. Every change also asks the viewport to redraw, because it
+	 * draws on demand and would otherwise keep showing the floor it last drew.
+	 */
+	virtual void Tick(const FGeometry& AllottedGeometry, const double InCurrentTime, const float InDeltaTime) override;
+
+	/** Anybody put anything beside the subject? The answer decides which space the viewer works in. */
+	bool HasCompanions() const { return Companions.Num() > 0; }
+
+	/**
+	 * Triangles, vertices, materials and bounds of what is on screen, for the strip beneath it.
+	 *
+	 * `bWithPivot` also reports where the bounds centre sits, which is only worth the width in true
+	 * space - there it is the number that answers *why is it floating over there*, and without it
+	 * the strip says a garment is the right size while it hangs a foot from the body.
+	 */
+	FText DescribeMesh(bool bWithPivot = false) const;
 
 	// FGCObject - the preview component is not owned by anything the GC can otherwise see.
 	virtual void AddReferencedObjects(FReferenceCollector& Collector) override;
@@ -175,9 +241,29 @@ protected:
 	virtual TSharedRef<FEditorViewportClient> MakeEditorViewportClient() override;
 
 private:
+	/** Whichever of the two is drawing the subject now. Null when nothing is. */
+	UMeshComponent* ActiveComponent() const;
+
 	TSharedPtr<FAdvancedPreviewScene> PreviewScene;
 	TSharedPtr<FMeshDefPreviewClient> Client;
+
+	/**
+	 * One of each, both registered from the start, and only one ever holding a mesh.
+	 *
+	 * Made once rather than swapped per subject: adding and removing components from a preview
+	 * scene as somebody flips down a list of takes is work for no gain, and a component that has
+	 * been unregistered and registered again loses the transform it was placed with.
+	 */
 	TObjectPtr<UStaticMeshComponent> Component;
+	TObjectPtr<USkeletalMeshComponent> SkeletalComponent;
+
+	/** What the subject was placed with, so a companion added later lands in the same space. */
+	FTransform SubjectTransform = FTransform::Identity;
+
+	/** By the extension that asked for them. */
+	TMap<FName, TArray<TObjectPtr<USceneComponent>>> Companions;
+
+	bool bFloorVisible = false;
 };
 
 /**
@@ -198,7 +284,7 @@ private:
  * imported mesh, and a blank viewport says nothing about *why* - so this says which stage has not
  * run yet.
  */
-class SMeshDefPreview : public SCompoundWidget
+class SMeshDefPreview : public SCompoundWidget, public IMeshDefPreviewHost
 {
 public:
 	SLATE_BEGIN_ARGS(SMeshDefPreview) {}
@@ -210,12 +296,21 @@ public:
 	/** Re-read the definition. Called when a stage finishes or the asset changes under us. */
 	void Refresh();
 
+	// IMeshDefPreviewHost - what an add-on's control in this bar is allowed to ask for.
+	virtual UMeshDef* GetDefinition() const override { return Definition.Get(); }
+	virtual int32 NumSides() const override { return bCompare ? 2 : 1; }
+	virtual UObject* GetSubject(int32 Side) const override;
+	virtual void SetCompanions(FName ExtensionId, int32 Side, const TArray<USceneComponent*>& Components) override;
+	virtual void Reframe() override;
+	virtual void Redraw() override;
+
 private:
 
 	/** One mesh this definition has produced and that is still in the project. */
 	struct FMeshChoice
 	{
-		TSoftObjectPtr<UStaticMesh> Mesh;
+		/** A UStaticMesh or a USkeletalMesh: a garment is the first until it is skinned and the second after. */
+		TSoftObjectPtr<UObject> Mesh;
 
 		/** The take folder this came out of, or "supplied" for a mesh somebody set by hand. */
 		FText Label;
@@ -245,12 +340,29 @@ private:
 	TSharedRef<SWidget> BuildChoiceMenu(bool bSideB);
 	TSharedRef<SWidget> BuildViewModeMenu();
 
-	void Choose(bool bSideB, TSoftObjectPtr<UStaticMesh> Mesh);
+	void Choose(bool bSideB, TSoftObjectPtr<UObject> Mesh);
 	void SetCompare(bool bOn);
 	void Swap();
 
 	/** Push the chosen meshes into the viewports, and frame them - together, when comparing. */
 	void ApplyMeshes();
+
+	/**
+	 * Decide which space the viewer is in, and place both subjects in it.
+	 *
+	 * **Two questions, two spaces, and what is on screen picks between them.** With nothing beside
+	 * the subject the question is *which of these takes is better*, and the answer needs the takes
+	 * normalised - centred, and fitted to each other on request - because two generators disagree
+	 * about scale and pivot and that disagreement is not the thing being judged. Put a character in
+	 * the picture and the question becomes *does this fit*, which is entirely about scale and pivot,
+	 * and every one of those helpful adjustments becomes a lie. So then nothing is adjusted at all.
+	 *
+	 * Called whenever either could have changed: a new subject, or companions coming or going.
+	 */
+	void ApplySpace();
+
+	/** True space: something is standing beside the subject, so nothing is centred, turned or scaled. */
+	bool IsTrueSpace() const;
 
 	/**
 	 * What was on screen the last time the camera was framed.
@@ -259,19 +371,28 @@ private:
 	 * editor changes state, and a viewer that re-framed on each of those would snatch the camera
 	 * back to three-quarters-from-above while somebody was leaning into a seam.
 	 */
-	TWeakObjectPtr<UStaticMesh> FramedA;
-	TWeakObjectPtr<UStaticMesh> FramedB;
+	TWeakObjectPtr<UObject> FramedA;
+	TWeakObjectPtr<UObject> FramedB;
 	bool bFramedCompare = false;
 	bool bFramedAlign = true;
+
+	/** Which space the last placement used, so the camera is re-framed when it changes and not otherwise. */
+	bool bFramedTrueSpace = false;
 
 	/** Push the view mode into both viewports, because it belongs to the viewer and not to a side. */
 	void ApplyViewMode();
 
+	/** Push the floor setting into both viewports, for the same reason. */
+	void ApplyFloor();
+
 	/** What is chosen for a side, falling back to the definition's own imported mesh for A. */
-	TSoftObjectPtr<UStaticMesh> Chosen(bool bSideB) const;
+	TSoftObjectPtr<UObject> Chosen(bool bSideB) const;
 
 	FText ChoiceLabel(bool bSideB) const;
 	FText ViewModeLabel() const;
+
+	/** Why Align is greyed, when it is. */
+	FText AlignTooltip() const;
 
 	EVisibility CompareOnlyVisibility() const;
 	EVisibility EmptyVisibility() const;
@@ -287,10 +408,19 @@ private:
 
 	TArray<FMeshChoice> Choices;
 
-	TSoftObjectPtr<UStaticMesh> ChosenA;
-	TSoftObjectPtr<UStaticMesh> ChosenB;
+	TSoftObjectPtr<UObject> ChosenA;
+	TSoftObjectPtr<UObject> ChosenB;
 
 	bool bCompare = false;
+
+	/**
+	 * The add-ons' controls, made once when the bar is built and kept for as long as it is.
+	 *
+	 * Kept rather than made per draw because an extension holds state a person set - which
+	 * character is standing behind the garment - and a control rebuilt on every refresh would
+	 * forget it.
+	 */
+	TArray<TSharedRef<IMeshDefPreviewExtension>> Extensions;
 
 	/**
 	 * Fit B onto A: same centre, same apparent size.
@@ -306,6 +436,14 @@ private:
 
 	/** What B was scaled by to match A. One when nothing was done. */
 	float AlignScale = 1.0f;
+
+	/**
+	 * How much bigger B's bounds are than A's, in true space, where nothing was scaled.
+	 *
+	 * Worked out when the subjects are placed and kept, not asked for by the stats strip: that text
+	 * is a delegate read every frame, and measuring a take means sampling twenty thousand vertices.
+	 */
+	float TrueSpaceRatio = 1.0f;
 
 	/** How far B was turned to match A. Reported, so the fit is never a silent guess. */
 	FRotator AlignRotation = FRotator::ZeroRotator;

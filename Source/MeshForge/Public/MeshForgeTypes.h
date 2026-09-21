@@ -612,6 +612,10 @@ struct MESHFORGE_API FMeshDefSpec
 {
 	GENERATED_BODY()
 
+	/**
+	 * The brief. Every image and mesh pipeline set on the definition afterwards starts from it, and each
+	 * then keeps its own - a picture and the mesh made from it often want different words.
+	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spec")
 	FString Prompt;
 
@@ -775,6 +779,70 @@ enum class EMeshStage : uint8
 
 	/** Into Unreal: collision, lightmap UVs, Nanite, LODs, texture settings, scale and pivot. */
 	Import      UMETA(DisplayName = "Import"),
+};
+
+/**
+ * Which of a definition's five stages it uses. All on by default, which is how every definition made
+ * before stages could be switched off keeps behaving - and hashing - exactly as it did.
+ *
+ * A stage that is off is not a stage that failed or has not run: it is not part of this definition. It
+ * is hidden from the Stages tab, refused by the subsystem and the agent tools, and left out of
+ * staleness, so editing its pipeline does not mark anything after it stale.
+ */
+USTRUCT(BlueprintType)
+struct MESHFORGE_API FMeshStageSwitches
+{
+	GENERATED_BODY()
+
+	/** Draw pictures from the prompt. Off when the pictures come from somewhere else. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Stages")
+	bool bConcept = true;
+
+	/** Run refinement pipelines over the pictures. The main image and views are chosen either way. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Stages")
+	bool bReferences = true;
+
+	/** Generate the mesh. Off means the definition works on a Source Mesh it already has. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Stages")
+	bool bMesh = true;
+
+	/** Run the post-processing chain. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Stages")
+	bool bPost = true;
+
+	/** Import the first finished take automatically. Off files takes for review; the Takes tab still imports. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Stages")
+	bool bImport = true;
+
+	bool IsOn(EMeshStage Stage) const
+	{
+		switch (Stage)
+		{
+		case EMeshStage::Concept:    return bConcept;
+		case EMeshStage::References: return bReferences;
+		case EMeshStage::Mesh:       return bMesh;
+		case EMeshStage::Post:       return bPost;
+		default:                     return bImport;
+		}
+	}
+
+	void Set(EMeshStage Stage, bool bOn)
+	{
+		switch (Stage)
+		{
+		case EMeshStage::Concept:    bConcept    = bOn; break;
+		case EMeshStage::References: bReferences = bOn; break;
+		case EMeshStage::Mesh:       bMesh       = bOn; break;
+		case EMeshStage::Post:       bPost       = bOn; break;
+		default:                     bImport     = bOn; break;
+		}
+	}
+
+	bool operator==(const FMeshStageSwitches& Other) const
+	{
+		return bConcept == Other.bConcept && bReferences == Other.bReferences && bMesh == Other.bMesh
+			&& bPost == Other.bPost && bImport == Other.bImport;
+	}
 };
 
 UENUM(BlueprintType)

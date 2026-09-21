@@ -3,6 +3,7 @@
 #include "MeshForge.h"
 
 #include "Engine/StaticMesh.h"
+#include "Engine/SkeletalMesh.h"
 #include "HAL/FileManager.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
@@ -10,8 +11,25 @@
 #include "Exporters/GLTFExporter.h"
 #include "Options/GLTFExportOptions.h"
 
+namespace MeshExporterPrivate
+{
+	static FMeshExportResult Export(UObject* Mesh, const FString& AbsolutePath, const FMeshExportOptions& Options);
+}
+
 FMeshExportResult FMeshExporter::ToGlb(
 	UStaticMesh* Mesh, const FString& AbsolutePath, const FMeshExportOptions& Options)
+{
+	return MeshExporterPrivate::Export(Mesh, AbsolutePath, Options);
+}
+
+FMeshExportResult FMeshExporter::ToGlb(
+	USkeletalMesh* Mesh, const FString& AbsolutePath, const FMeshExportOptions& Options)
+{
+	return MeshExporterPrivate::Export(Mesh, AbsolutePath, Options);
+}
+
+FMeshExportResult MeshExporterPrivate::Export(
+	UObject* Mesh, const FString& AbsolutePath, const FMeshExportOptions& Options)
 {
 	FMeshExportResult Result;
 

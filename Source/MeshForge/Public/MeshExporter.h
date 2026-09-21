@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 
 class UStaticMesh;
+class USkeletalMesh;
 
 /** How a mesh is written out. */
 struct MESHFORGE_API FMeshExportOptions
@@ -73,6 +74,18 @@ public:
 	/** Write one static mesh to an absolute .glb path, creating the directory if needed. */
 	static FMeshExportResult ToGlb(
 		UStaticMesh* Mesh,
+		const FString& AbsolutePath,
+		const FMeshExportOptions& Options = FMeshExportOptions());
+
+	/**
+	 * The same for a skeletal mesh, in its reference pose with its skin.
+	 *
+	 * Through the same exporter with the same scale, so a body written here and a garment written by the
+	 * overload above land in the same space - which is what lets the body stand in Blender as a
+	 * reference the garment is edited against.
+	 */
+	static FMeshExportResult ToGlb(
+		USkeletalMesh* Mesh,
 		const FString& AbsolutePath,
 		const FMeshExportOptions& Options = FMeshExportOptions());
 

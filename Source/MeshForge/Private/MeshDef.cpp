@@ -19,14 +19,22 @@
 
 namespace MeshDefStages
 {
-	/** A pipeline's contribution to a hash, or a marker saying there wasn't one. */
-	static FString Describe(const UMeshForgePipeline* Pipeline)
+	/**
+	 * A pipeline's contribution to a hash, or a marker saying there wasn't one.
+	 *
+	 * **A pipeline's prompt is added only where it differs from the definition's own Prompt.** The prompt
+	 * used to live on the definition alone and be hashed there; it now lives on each pipeline, outside
+	 * Signature(). A pipeline whose prompt was copied from the definition's therefore hashes exactly as it
+	 * did, and one whose prompt was edited since does not. Post steps are left out: they do not read it.
+	 */
+	static FString Describe(const UMeshForgePipeline* Pipeline, const FString& DefinitionPrompt)
 	{
 		if (Pipeline == nullptr)  { return TEXT("none|"); }
 		if (!Pipeline->bEnabled)  { return TEXT("off|"); }
 		if (const UMeshPostPipeline* Post = Cast<UMeshPostPipeline>(Pipeline))
 			return Post->Signature() + FString::Printf(TEXT("|input=%d:%s|"), int32(Post->InputSource), *Post->InputMesh.ToString());
-		return Pipeline->Signature() + TEXT("|");
+		const FString OwnPrompt = Pipeline->Prompt != DefinitionPrompt ? TEXT("prompt=") + Pipeline->Prompt + TEXT("|") : FString();
+		return Pipeline->Signature() + TEXT("|") + OwnPrompt;
 	}
 
 	/**
@@ -36,12 +44,12 @@ namespace MeshDefStages
 	 * no longer produces.
 	 */
 	template <typename PipelineType>
-	static FString Describe(const TArray<TObjectPtr<PipelineType>>& Pipelines)
+	static FString Describe(const TArray<TObjectPtr<PipelineType>>& Pipelines, const FString& DefinitionPrompt)
 	{
 		FString Out;
 		for (const TObjectPtr<PipelineType>& Pipeline : Pipelines)
 		{
-			Out += Describe(static_cast<const UMeshForgePipeline*>(Pipeline.Get()));
+			Out += Describe(static_cast<const UMeshForgePipeline*>(Pipeline.Get()), DefinitionPrompt);
 		}
 		return Out.IsEmpty() ? TEXT("empty|") : Out;
 	}
@@ -67,22 +75,62 @@ FMeshStageState UMeshDef::GetStageState(EMeshStage Stage) const
 	return FMeshStageState();
 }
 
+bool UMeshDef::IsStageEnabled(EMeshStage Stage) const
+{
+	if (!StageSwitches.IsOn(Stage))
+	{
+		return false;
+	}
+
+	const bool bMakesTheMesh = Stage == EMeshStage::Concept || Stage == EMeshStage::References || Stage == EMeshStage::Mesh;
+	return !(bMakesTheMesh && !SourceMesh.IsNull());
+}
+
+FString UMeshDef::DescribeDisabledStage(EMeshStage Stage) const
+{
+	if (IsStageEnabled(Stage))
+	{
+		return FString();
+	}
+
+	const FString Name = StaticEnum<EMeshStage>()->GetDisplayNameTextByValue(static_cast<int64>(Stage)).ToString();
+
+	if (StageSwitches.IsOn(Stage))
+	{
+		return FString::Printf(TEXT("'%s' supplies its own mesh, so %s is skipped. Clear Source Mesh to use it."),
+			*GetName(), *Name);
+	}
+
+	return FString::Printf(TEXT("%s is switched off for '%s'. Turn it on with the stage switches at the top of the Stages tab."),
+		*Name, *GetName());
+}
+
 FString UMeshDef::ComputeStageHash(EMeshStage Stage) const
 {
 	// Each stage's hash includes every stage before it. That is what makes editing the prompt mark
 	// the *mesh* stale rather than only the concept image - the mesh was made from a picture that
 	// no longer exists, and saying so is the whole point of this.
+	//
+	// **A switched-off stage contributes a marker instead of its inputs, and a switched-on stage adds
+	// nothing new.** So editing a disabled stage's pipeline does not stale what comes after it, and a
+	// definition with every stage on - every definition saved before the switches existed - hashes to
+	// exactly the string it always did. Only the switch is read here, not the Source Mesh rule: that
+	// rule is not new, and folding it in would change the hashes of existing post-only definitions.
 	FString Input;
 
 	Input += TEXT("prompt=") + Prompt + TEXT("|");
-	Input += TEXT("concept=") + MeshDefStages::Describe(ConceptPipeline) ;
+	Input += StageSwitches.bConcept
+		? TEXT("concept=") + MeshDefStages::Describe(ConceptPipeline, Prompt)
+		: FString(TEXT("concept=off|"));
 
 	if (Stage == EMeshStage::Concept)
 	{
 		return FMD5::HashAnsiString(*Input);
 	}
 
-	Input += TEXT("refine=") + MeshDefStages::Describe(RefinementPipelines);
+	Input += StageSwitches.bReferences
+		? TEXT("refine=") + MeshDefStages::Describe(RefinementPipelines, Prompt)
+		: FString(TEXT("refine=off|"));
 	Input += TEXT("srcimg=") + SourceImage.ToString() + TEXT("|");
 	Input += TEXT("srcpath=") + SourceImagePath + TEXT("|");
 	Input += TEXT("concepts=") + MeshDefStages::Describe(ConceptImages);
@@ -98,19 +146,28 @@ FString UMeshDef::ComputeStageHash(EMeshStage Stage) const
 	// First, because it overrides everything above it: a definition that supplies its own mesh
 	// is not made from the pictures the stages before it drew.
 	Input += TEXT("srcmesh=") + SourceMesh.ToString() + TEXT("|");
-	Input += TEXT("meshpipe=") + MeshDefStages::Describe(MeshPipeline);
-	Input += TEXT("provider=") + ProviderId.ToString() + TEXT("|");
-	Input += TEXT("model=") + ModelId + TEXT("|");
-	Input += FString::Printf(TEXT("quality=%d|variants=%d|seed=%d|useseed=%d|"),
-		static_cast<int32>(Control.Quality), Variants, Control.Seed, Control.bUseSeed ? 1 : 0);
-	Input += TEXT("refs=") + MeshDefStages::Describe(ReferenceImages);
+	if (StageSwitches.bMesh)
+	{
+		Input += TEXT("meshpipe=") + MeshDefStages::Describe(MeshPipeline, Prompt);
+		Input += TEXT("provider=") + ProviderId.ToString() + TEXT("|");
+		Input += TEXT("model=") + ModelId + TEXT("|");
+		Input += FString::Printf(TEXT("quality=%d|variants=%d|seed=%d|useseed=%d|"),
+			static_cast<int32>(Control.Quality), Variants, Control.Seed, Control.bUseSeed ? 1 : 0);
+		Input += TEXT("refs=") + MeshDefStages::Describe(ReferenceImages);
+	}
+	else
+	{
+		Input += TEXT("mesh=off|");
+	}
 
 	if (Stage == EMeshStage::Mesh)
 	{
 		return FMD5::HashAnsiString(*Input);
 	}
 
-	Input += TEXT("post=") + MeshDefStages::Describe(PostPipelines);
+	Input += StageSwitches.bPost
+		? TEXT("post=") + MeshDefStages::Describe(PostPipelines, Prompt)
+		: FString(TEXT("post=off|"));
 	Input += TEXT("selectedmesh=") + SelectedMeshId + TEXT("|");
 
 	if (Stage == EMeshStage::Post)
@@ -128,7 +185,53 @@ FString UMeshDef::ComputeStageHash(EMeshStage Stage) const
 		Input += TEXT("finish=") + FinishText;
 	}
 
+	if (!StageSwitches.bImport)
+	{
+		Input += TEXT("|import=off");
+	}
+
 	return FMD5::HashAnsiString(*Input);
+}
+
+FString UMeshDef::PostStepMoveProblem(int32 From, int32 To) const
+{
+	if (!PostPipelines.IsValidIndex(From) || !PostPipelines.IsValidIndex(To))
+	{
+		return TEXT("There is no step there to move.");
+	}
+	if (From == To)
+	{
+		return TEXT("The step is already there.");
+	}
+
+	TArray<const UMeshPostPipeline*> Order;
+	for (const TObjectPtr<UMeshPostPipeline>& Step : PostPipelines)
+	{
+		Order.Add(Step.Get());
+	}
+	const UMeshPostPipeline* Moved = Order[From];
+	Order.RemoveAt(From);
+	Order.Insert(Moved, To);
+
+	return UMeshPostPipeline::ChainOrderProblem(Order);
+}
+
+bool UMeshDef::MovePostStep(int32 From, int32 To, FString& OutError)
+{
+	OutError = PostStepMoveProblem(From, To);
+	if (!OutError.IsEmpty())
+	{
+		return false;
+	}
+
+	Modify();
+	UMeshPostPipeline* Moved = PostPipelines[From];
+	PostPipelines.RemoveAt(From);
+	PostPipelines.Insert(Moved, To);
+
+	RefreshStaleness();
+	MarkPackageDirty();
+	return true;
 }
 
 void UMeshDef::RefreshStaleness()
@@ -142,6 +245,13 @@ void UMeshDef::RefreshStaleness()
 
 	for (const EMeshStage Stage : Order)
 	{
+		// A switched-off stage is not part of this definition: it neither goes stale nor passes drift on.
+		// Its output, if it ever made one, keeps whatever status it had.
+		if (!StageSwitches.IsOn(Stage))
+		{
+			continue;
+		}
+
 		FMeshStageState* State = Stages.Find(Stage);
 		if (State == nullptr || !State->HasOutput())
 		{
@@ -184,6 +294,35 @@ FMeshCandidate* UMeshDef::FindCandidateByJobMutable(const FString& JobId)
 void UMeshDef::PostLoad()
 {
 	Super::PostLoad();
+
+	// The one prompt every definition had, copied into the pipelines that now own theirs. Once: a prompt
+	// somebody clears on a pipeline afterwards must stay cleared. Every image and mesh pipeline gets it,
+	// whether or not its provider reads text - the hash compares against Prompt, so a copy changes nothing,
+	// and whether a provider reads text is not known until its plugin has loaded.
+	if (!bPromptOnPipelines)
+	{
+		if (!Prompt.IsEmpty())
+		{
+			auto Seed = [this](UMeshForgePipeline* Pipeline)
+			{
+				if (Pipeline != nullptr)
+				{
+					Pipeline->ConditionalPreload();
+					if (Pipeline->Prompt.IsEmpty())
+					{
+						Pipeline->Prompt = Prompt;
+					}
+				}
+			};
+			Seed(ConceptPipeline);
+			for (UMeshForgePipeline* Refine : RefinementPipelines)
+			{
+				Seed(Refine);
+			}
+			Seed(MeshPipeline);
+		}
+		bPromptOnPipelines = true;
+	}
 
 	// Nothing can be running: jobs live in the subsystem's memory and this asset has just been read
 	// off disk. Anything still claiming to run was interrupted, so say so rather than leave a lock
@@ -250,6 +389,35 @@ int32 UMeshDef::CountUsableCandidates() const
 	return Count;
 }
 
+FString UMeshDef::GetMeshPrompt() const
+{
+	return MeshPipeline != nullptr ? MeshPipeline->Prompt : Prompt;
+}
+
+EMeshPipelineInput UMeshDef::GetMeshInput() const
+{
+	return MeshPipeline != nullptr && MeshPipeline->bEnabled ? MeshPipeline->GetInputMode() : EMeshPipelineInput::Either;
+}
+
+FString UMeshDef::GetBrief() const
+{
+	const FString Mesh = GetMeshPrompt();
+	if (!Mesh.IsEmpty())
+	{
+		return Mesh;
+	}
+	return ConceptPipeline != nullptr && !ConceptPipeline->Prompt.IsEmpty() ? ConceptPipeline->Prompt : Prompt;
+}
+
+void UMeshDef::CarryPrompt(const UMeshForgePipeline* From, UMeshForgePipeline* To, const FString& Fallback)
+{
+	if (To == nullptr || !To->Prompt.IsEmpty())
+	{
+		return;
+	}
+	To->Prompt = From != nullptr && !From->Prompt.IsEmpty() ? From->Prompt : Fallback;
+}
+
 bool UMeshDef::HasInput() const
 {
 	// A supplied mesh counts, and has to: a definition made purely to retexture a corridor has no
@@ -257,6 +425,8 @@ bool UMeshDef::HasInput() const
 	// stage that guards on it refuses.
 	return !SourceMesh.IsNull()
 		|| !Prompt.IsEmpty()
+		|| (ConceptPipeline != nullptr && !ConceptPipeline->Prompt.IsEmpty())
+		|| (MeshPipeline != nullptr && !MeshPipeline->Prompt.IsEmpty())
 		|| !ResolveMainImage().IsNull()
 		|| !SourceImagePath.IsEmpty();
 }

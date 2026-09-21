@@ -12,6 +12,10 @@
 #include "MeshPostPipeline.h"
 #include "MeshExporter.h"
 #include "Async/Async.h"
+#include "Dom/JsonObject.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
+#include "Serialization/JsonWriter.h"
 #include "Misc/ScopeExit.h"
 
 #include "AssetRegistry/AssetRegistryModule.h"
@@ -21,6 +25,7 @@
 #include "Engine/SkeletalMesh.h"
 #include "MeshDescription.h"
 #include "StaticMeshAttributes.h"
+#include "PhysicsEngine/BodySetup.h"
 #include "Engine/Texture2D.h"
 #include "HAL/FileManager.h"
 #include "HttpManager.h"
@@ -82,6 +87,14 @@ void UMeshForgeSubsystem::Deinitialize()
 		PollHandle.Reset();
 	}
 
+	if (InteractiveHandle.IsValid())
+	{
+		FTSTicker::GetCoreTicker().RemoveTicker(InteractiveHandle);
+		InteractiveHandle.Reset();
+	}
+
+	InteractiveWaits.Empty();
+	PostContinuations.Empty();
 	Batches.Empty();
 
 	Super::Deinitialize();
@@ -196,7 +209,10 @@ FMeshControl UMeshForgeSubsystem::ResolveControl(const UMeshDef* Def, FString& O
 
 bool UMeshForgeSubsystem::HasReferenceImage(const UMeshDef* Def) const
 {
+	// A generator set to words only is priced as a text request whatever the gallery holds, because
+	// that is the request it sends - and on Tripo the text one is ten credits cheaper.
 	return Def != nullptr
+		&& Def->GetMeshInput() != EMeshPipelineInput::Text
 		&& (!Def->ResolveMainImage().IsNull() || !Def->SourceImagePath.IsEmpty());
 }
 
@@ -207,7 +223,11 @@ int32 UMeshForgeSubsystem::UsableExtraViews(const UMeshDef* Def) const
 	// settings - which is where that switch lives, beside everything else about the request. It used
 	// to live on the definition as well, and two switches meaning the same thing is how a panel
 	// starts disagreeing with what was actually sent.
-	return Def ? FMath::Min(Def->ExtraViews.Num(), Def->MaxExtraViews()) : 0;
+	if (Def == nullptr || Def->GetMeshInput() == EMeshPipelineInput::Text)
+	{
+		return 0;
+	}
+	return FMath::Min(Def->ExtraViews.Num(), Def->MaxExtraViews());
 }
 
 UMeshDef* UMeshForgeSubsystem::CreateMeshDef(
@@ -306,7 +326,9 @@ int32 UMeshForgeSubsystem::SubmitDef(
 	const FMeshProviderCaps Caps = Provider->GetCaps();
 
 	FMeshSubmitRequest Base;
-	Base.Prompt  = Def->Prompt;
+	// The mesh generator's own words - the picture had its own, on the concept pipeline.
+	const FString MeshPrompt = Def->GetMeshPrompt();
+	Base.Prompt  = MeshPrompt;
 	Base.Control = Def->Control;
 	Base.ModelId = Def->ModelId;
 
@@ -323,15 +345,40 @@ int32 UMeshForgeSubsystem::SubmitDef(
 		Base.ModelId = Provider->GetDefaultModelId();
 	}
 
-	FString ImageError;
-	const bool bHasImage = ResolveSourceImage(Def, Base.ImagePng, ImageError);
+	// **The pipeline's choice of input decides the request, not what happens to be in the gallery.** A
+	// main picture used to turn a text request into an image one without a word, and the reverse.
+	const EMeshPipelineInput Input = Def->GetMeshInput();
+
+	if (Input == EMeshPipelineInput::Text && MeshPrompt.IsEmpty())
+	{
+		OutError = FString::Printf(
+			TEXT("'%s' is set to generate from text and its prompt is empty."), *Def->GetName());
+		return 0;
+	}
+
+	FString ImageError = TEXT("the generator is set to text only");
+	const bool bHasImage = Input != EMeshPipelineInput::Text
+		&& ResolveSourceImage(Def, Base.ImagePng, ImageError);
+
+	if (Input == EMeshPipelineInput::Image)
+	{
+		if (!bHasImage)
+		{
+			OutError = FString::Printf(
+				TEXT("'%s' is set to generate from a picture and has none to send (%s)."),
+				*Def->GetName(), *ImageError);
+			return 0;
+		}
+
+		Base.Prompt.Empty();
+	}
 
 	if (!bHasImage && Caps.bRequiresImage)
 	{
 		// The interesting case, and the reason IMeshProvider has a concept-image call at all. An
 		// image-to-3D model cannot be driven from a prompt - but it may be able to draw one first,
 		// which makes a text-only definition work on a provider that has no text path.
-		if (Def->Prompt.IsEmpty())
+		if (MeshPrompt.IsEmpty())
 		{
 			OutError = FString::Printf(
 				TEXT("'%s' needs an image and this definition has neither an image nor a prompt (%s)."),
@@ -372,7 +419,7 @@ int32 UMeshForgeSubsystem::SubmitDef(
 			bool bDone = false;
 			FString DrawError;
 
-			Provider->GenerateConceptImage(Def->Prompt, Def->Control,
+			Provider->GenerateConceptImage(MeshPrompt, Def->Control,
 				[&Base, &bDrawn, &bDone, &DrawError](bool bSuccess, const TArray<uint8>& Png, const FString& Error)
 				{
 					bDrawn = bSuccess;
@@ -469,7 +516,7 @@ int32 UMeshForgeSubsystem::SubmitDef(
 	}
 
 	// A provider that ignores text entirely should not be handed a prompt that will vanish silently.
-	if (Base.ImagePng.Num() > 0 && !Caps.bSupportsTextWithImage && !Def->Prompt.IsEmpty())
+	if (Base.ImagePng.Num() > 0 && !Caps.bSupportsTextWithImage && !MeshPrompt.IsEmpty())
 	{
 		UE_LOG(LogMeshForge, Log,
 			TEXT("'%s' generates from the image only; the prompt on '%s' is not used."),
@@ -604,6 +651,15 @@ FMeshBatchSubmission UMeshForgeSubsystem::GenerateMeshes(const TArray<UMeshDef*>
 			continue;
 		}
 
+		// Both ways into generation come through here - the panel's Generate and the agent tool - so the
+		// switch is enforced once. Not recorded as a failure on the definition: nothing went wrong with it.
+		if (!Def->StageSwitches.bMesh)
+		{
+			++Submission.Failed;
+			Submission.LastError = Def->DescribeDisabledStage(EMeshStage::Mesh);
+			continue;
+		}
+
 		if (!Def->HasInput())
 		{
 			++Submission.Failed;
@@ -634,6 +690,25 @@ FMeshBatchSubmission UMeshForgeSubsystem::GenerateMeshes(const TArray<UMeshDef*>
 				*Provider->GetDisplayName(), *Reason);
 			Def->SetStatus(EMeshDefStatus::Failed, Submission.LastError);
 			continue;
+		}
+
+		// **Asked here, because here is where both routes actually pass.** The Stages tab checks a
+		// pipeline before it offers to run, so a self-contradicting one never reaches the button -
+		// but the agent tool comes straight in, and until this was added it submitted. A vendor that
+		// silently drops a setting it cannot honour, or silently reinterprets it, turns a warning
+		// into an invoice; measured the hard way, 30 credits, asking for 4k geometry on a model that
+		// has none.
+		if (Def->MeshPipeline != nullptr && Def->MeshPipeline->bEnabled)
+		{
+			const FString Complaint = Def->MeshPipeline->Validate();
+
+			if (!Complaint.IsEmpty())
+			{
+				++Submission.Failed;
+				Submission.LastError = Complaint;
+				Def->SetStatus(EMeshDefStatus::Failed, Complaint);
+				continue;
+			}
 		}
 
 		FString SubmitError;
@@ -781,7 +856,9 @@ void UMeshForgeSubsystem::FinishJob(
 
 	const UMeshForgeSettings* Settings = UMeshForgeSettings::Get();
 
-	if (!Settings->bAutoImportFirstSuccess)
+	// Import switched off files the take and stops: it is in the library and the Takes tab, imported by
+	// hand when somebody has looked at it.
+	if (!Settings->bAutoImportFirstSuccess || !Def->StageSwitches.bImport)
 	{
 		OnDefFinished.Broadcast(Def, true);
 		return;
@@ -1001,7 +1078,7 @@ FForgeTakeRecord UMeshForgeSubsystem::BuildTakeRecord(
 	FString Model;
 	const FMeshControl Control = ResolveControl(Def, Model);
 
-	Record.Prompt = Def->Prompt;
+	Record.Prompt = Def->GetMeshPrompt();
 
 	// What was actually sent, not what the definition happens to hold now. The two differ the moment
 	// a pipeline is applied over the definition's advanced settings, and the record has to be the
@@ -1052,9 +1129,13 @@ FForgeTakeRecord UMeshForgeSubsystem::BuildTakeRecord(
 		Record.Inputs.Add(Input);
 	};
 
-	AddImage(Def->ResolveMainImage(), TEXT("main"));
+	// Only what was sent: nothing from a generator set to words, and no more views than the model read.
+	if (HasReferenceImage(Def))
+	{
+		AddImage(Def->ResolveMainImage(), TEXT("main"));
+	}
 
-	for (int32 Index = 0; Index < Def->ExtraViews.Num(); ++Index)
+	for (int32 Index = 0; Index < UsableExtraViews(Def); ++Index)
 	{
 		AddImage(Def->ExtraViews[Index], *FString::Printf(TEXT("view%d"), Index + 1));
 	}
@@ -1580,6 +1661,12 @@ FGuid UMeshForgeSubsystem::StartConceptDraw(UMeshDef* Def, FString& OutError)
 		return FGuid();
 	}
 
+	if (!Def->StageSwitches.bConcept)
+	{
+		OutError = Def->DescribeDisabledStage(EMeshStage::Concept);
+		return FGuid();
+	}
+
 	if (IsStageRunning(Def, EMeshStage::Concept))
 	{
 		OutError = TEXT("This definition is already drawing. Wait for it to finish.");
@@ -1602,9 +1689,10 @@ FGuid UMeshForgeSubsystem::StartConceptDraw(UMeshDef* Def, FString& OutError)
 		return FGuid();
 	}
 
-	if (Def->Prompt.IsEmpty())
+	// Only a pipeline that draws from words needs any; one that works from pictures is given those.
+	if (Pipeline->ReadsPrompt() && Pipeline->Prompt.IsEmpty())
 	{
-		OutError = TEXT("Write a prompt before drawing a reference image.");
+		OutError = TEXT("Write what to draw in the Concept image stage's prompt before drawing.");
 		return FGuid();
 	}
 
@@ -1650,7 +1738,7 @@ FGuid UMeshForgeSubsystem::StartConceptDraw(UMeshDef* Def, FString& OutError)
 	OnJobsChanged.Broadcast();
 
 	const FGuid JobId = Job.Id;
-	const FString Prompt = Def->Prompt;
+	const FString Prompt = Pipeline->Prompt;
 
 	// --- the pictures the pipeline may work from ---------------------------------------------------
 	//
@@ -1859,6 +1947,12 @@ FGuid UMeshForgeSubsystem::StartMeshGeneration(UMeshDef* Def, FString& OutError)
 		return FGuid();
 	}
 
+	if (!Def->StageSwitches.bMesh)
+	{
+		OutError = Def->DescribeDisabledStage(EMeshStage::Mesh);
+		return FGuid();
+	}
+
 	if (Def->IsBusy())
 	{
 		OutError = TEXT("Jobs are already in flight for this definition; submitting again would "
@@ -1903,6 +1997,21 @@ FGuid UMeshForgeSubsystem::StartMeshGeneration(UMeshDef* Def, FString& OutError)
 	// nobody can explain.
 	const FMeshProviderCaps Caps = Provider->GetCaps();
 	const bool bTextOnly = Def->ResolveMainImage().IsNull() && Def->SourceImagePath.IsEmpty();
+	const EMeshPipelineInput Input = Def->GetMeshInput();
+
+	if (Input == EMeshPipelineInput::Text && Def->GetMeshPrompt().IsEmpty())
+	{
+		OutError = TEXT("This generator is set to build from words and its prompt is empty. Describe the "
+						"object in its Prompt, or set it to build from a picture.");
+		return FGuid();
+	}
+
+	if (Input == EMeshPipelineInput::Image && bTextOnly)
+	{
+		OutError = TEXT("This generator is set to build from a picture and no main image is chosen. Pick "
+						"one in the Images tab, or set it to build from words.");
+		return FGuid();
+	}
 
 	if (bTextOnly && Caps.bRequiresImage)
 	{
@@ -1921,6 +2030,9 @@ FGuid UMeshForgeSubsystem::StartMeshGeneration(UMeshDef* Def, FString& OutError)
 						"turn multiview_to_model off in the generator's settings.");
 		return FGuid();
 	}
+
+	// The pipeline is validated in GenerateMeshes, which is where every route to a submission
+	// converges - including this one, further down.
 
 	BeginMeshJob(Def);
 
@@ -2007,7 +2119,8 @@ bool UMeshForgeSubsystem::ResolvePostInput(
 	TArray<uint8>& OutGlb,
 	FName& OutProviderId,
 	FString& OutTaskId,
-	FString& OutError) const
+	FString& OutError,
+	const FString& TakeId) const
 {
 	OutGlb.Reset();
 	OutProviderId = NAME_None;
@@ -2080,7 +2193,21 @@ bool UMeshForgeSubsystem::ResolvePostInput(
 	}
 
 	// --- a take this definition generated ---------------------------------------------------------
-	const FMeshCandidate* Candidate = Def->FindSelectedCandidate();
+	//
+	// A take named by the step is that take and no other: falling back to a different one would run the
+	// step on a mesh nobody chose, and it would look exactly like the one they did.
+	if (!TakeId.IsEmpty())
+	{
+		const FMeshCandidate* Named = Def->FindCandidate(TakeId);
+		if (Named == nullptr || !Named->IsUsable())
+		{
+			OutError = FString::Printf(TEXT("'%s' no longer has the take this step was pointed at. Choose another."),
+				*Def->GetName());
+			return false;
+		}
+	}
+
+	const FMeshCandidate* Candidate = TakeId.IsEmpty() ? Def->FindSelectedCandidate() : Def->FindCandidate(TakeId);
 
 	if (Candidate == nullptr || !Candidate->IsUsable())
 	{
@@ -2140,6 +2267,39 @@ FGuid UMeshForgeSubsystem::StartPostProcessing(UMeshDef* Def, FString& OutError,
 		return FGuid();
 	}
 
+	// Only the enabled ones, in order. A step switched off is kept deliberately - comparing with and
+	// without is the common case - so skipping it here is what that switch is for.
+	TArray<int32> Requested;
+
+	for (int32 Index = 0; Index < Def->PostPipelines.Num(); ++Index)
+	{
+		const UMeshPostPipeline* Step = Def->PostPipelines[Index];
+		if (Step != nullptr && Step->bEnabled && (OnlyStep == INDEX_NONE || OnlyStep == Index))
+		{
+			Requested.Add(Index);
+		}
+	}
+
+	return StartPostSteps(Def, Requested, OutError);
+}
+
+FGuid UMeshForgeSubsystem::StartPostSteps(UMeshDef* Def, const TArray<int32>& Requested, FString& OutError)
+{
+	OutError.Reset();
+
+	if (Def == nullptr)
+	{
+		OutError = TEXT("No definition.");
+		return FGuid();
+	}
+
+	// The chain, a single step, a continuation and the agent tool all start here.
+	if (!Def->StageSwitches.bPost)
+	{
+		OutError = Def->DescribeDisabledStage(EMeshStage::Post);
+		return FGuid();
+	}
+
 	if (IsStageRunning(Def, EMeshStage::Post))
 	{
 		OutError = TEXT("This definition is already post-processing. Wait for it to finish.");
@@ -2152,15 +2312,13 @@ FGuid UMeshForgeSubsystem::StartPostProcessing(UMeshDef* Def, FString& OutError,
 		return FGuid();
 	}
 
-	// Only the enabled ones, in order. A step switched off is kept deliberately - comparing with and
-	// without is the common case - so skipping it here is what that switch is for.
 	TArray<UMeshPostPipeline*> Steps;
 	TArray<int32> StepIndices;
 
-	for (int32 Index = 0; Index < Def->PostPipelines.Num(); ++Index)
+	for (const int32 Index : Requested)
 	{
-		UMeshPostPipeline* Step = Def->PostPipelines[Index];
-		if (Step != nullptr && Step->bEnabled && (OnlyStep == INDEX_NONE || OnlyStep == Index))
+		UMeshPostPipeline* Step = Def->PostPipelines.IsValidIndex(Index) ? Def->PostPipelines[Index].Get() : nullptr;
+		if (Step != nullptr && Step->bEnabled)
 		{
 			Steps.Add(Step);
 			StepIndices.Add(Index);
@@ -2172,13 +2330,10 @@ FGuid UMeshForgeSubsystem::StartPostProcessing(UMeshDef* Def, FString& OutError,
 		OutError = TEXT("No post-processing steps to run. Add one on the Post stage.");
 		return FGuid();
 	}
-	for (int32 Index = 0; Index < Steps.Num(); ++Index)
+	OutError = UMeshPostPipeline::ChainOrderProblem(TArray<const UMeshPostPipeline*>(Steps));
+	if (!OutError.IsEmpty())
 	{
-		if (Steps[Index]->ProducesSkeletalMesh() && Index != Steps.Num() - 1)
-		{
-			OutError = TEXT("Skeletal wardrobe creation must be the last enabled post step: subsequent mesh steps require static geometry.");
-			return FGuid();
-		}
+		return FGuid();
 	}
 
 	// Asked before anything is spent, and before the export - which on a dense mesh is not free
@@ -2194,40 +2349,121 @@ FGuid UMeshForgeSubsystem::StartPostProcessing(UMeshDef* Def, FString& OutError,
 		}
 	}
 
+	// A step a person finishes splits the run in three: the steps before it run now, it starts when
+	// they are done, and the steps after it run once its result is back. Validated as a whole above,
+	// so a chain that would fail at its last step is refused before anybody opens Blender.
+	const int32 Interactive = Steps.IndexOfByPredicate(
+		[](const UMeshPostPipeline* Step) { return Step->IsInteractiveStep(); });
+
+	TArray<int32> Continuation;
+
+	if (Interactive != INDEX_NONE)
+	{
+		for (int32 Index = Interactive; Index < StepIndices.Num(); ++Index)
+		{
+			Continuation.Add(StepIndices[Index]);
+		}
+
+		if (Interactive == 0)
+		{
+			Continuation.RemoveAt(0);
+			return BeginInteractiveStep(Def, StepIndices[0], Continuation, OutError);
+		}
+
+		Steps.SetNum(Interactive);
+		StepIndices.SetNum(Interactive);
+	}
+
 	// Resolve and freeze every independent input before starting any work. Only an explicitly
 	// connected predecessor in this run supplies fresh bytes; a single-step run uses saved assets.
 	TArray<FMeshPostJob> Inputs;
-	TArray<bool> Fresh;
+	TArray<int32> FreshFrom;   // which earlier step in this run supplies the input, or INDEX_NONE
 	TArray<FString> InputPaths;
 	for (int32 Index = 0; Index < Steps.Num(); ++Index)
 	{
-		const bool bFresh = Index > 0 && Steps[Index]->InputSource == EMeshPostInputSource::PreviousStep
-			&& StepIndices[Index - 1] == StepIndices[Index] - 1;
-		Fresh.Add(bFresh);
+		int32 From = INDEX_NONE;
+		if (Index > 0 && Steps[Index]->InputSource == EMeshPostInputSource::PreviousStep
+			&& StepIndices[Index - 1] == StepIndices[Index] - 1)
+		{
+			From = Index - 1;
+		}
+		else if (Steps[Index]->InputSource == EMeshPostInputSource::StepOutput && Steps[Index]->InputTakeId.IsEmpty()
+			&& Steps[Index]->InputStepId.IsValid())
+		{
+			// "Latest run" of a step that runs earlier in this chain means this chain's run of it, not
+			// the one saved before the chain started - which is what the saved lookup would find.
+			for (int32 Earlier = Index - 1; Earlier >= 0; --Earlier)
+			{
+				if (Steps[Earlier]->StepId == Steps[Index]->InputStepId)
+				{
+					From = Earlier;
+					break;
+				}
+			}
+		}
+		if (From != INDEX_NONE && Steps[From]->IsNativeStep() && !Steps[Index]->IsNativeStep())
+		{
+			OutError = FString::Printf(TEXT("'%s' works on geometry and cannot start from '%s', which makes an asset."),
+				*Steps[Index]->GetStepDisplayName().ToString(), *Steps[From]->GetStepDisplayName().ToString());
+			return FGuid();
+		}
+		FreshFrom.Add(From);
 		FMeshPostJob& Input = Inputs.AddDefaulted_GetRef();
-		Input.Name = Def->GetName(); Input.Prompt = Def->Prompt;
+		Input.Name = Def->GetName(); Input.Prompt = Def->GetBrief();
 		InputPaths.Add(FString());
-		if (bFresh) continue;
-		TSoftObjectPtr<UStaticMesh> Mesh;
-		if (!ResolvePostStepMesh(Def, StepIndices[Index], Mesh, OutError)) return FGuid();
-		InputPaths[Index] = Mesh.ToString();
-		if (Mesh.IsNull())
+		TSoftObjectPtr<UObject> Mesh;
+		if (From == INDEX_NONE)
 		{
-			if (!ResolvePostInput(Def, Input.MeshGlb, Input.SourceProviderId, Input.SourceTaskId, OutError)) return FGuid();
+			if (!ResolvePostStepMesh(Def, StepIndices[Index], Mesh, OutError)) return FGuid();
+			InputPaths[Index] = Mesh.ToString();
 		}
-		else
+		// Native steps read their input asset directly on the game thread, without a GLB round trip.
+		if (Steps[Index]->IsNativeStep()) continue;
+		UStaticMesh* Loaded = nullptr;
+		if (!Mesh.IsNull())
 		{
-			UStaticMesh* Loaded = Mesh.LoadSynchronous();
+			Loaded = Cast<UStaticMesh>(Mesh.LoadSynchronous());
 			if (!Loaded) { OutError = TEXT("Could not load the selected input mesh."); return FGuid(); }
-			// Native creation reads this asset directly on the game thread, without a GLB round trip.
-			if (Steps[Index]->ProducesSkeletalMesh()) continue;
-			const FString Path = FPaths::ProjectIntermediateDir() / TEXT("MeshForge/PostInputs")
-				/ (FGuid::NewGuid().ToString() + TEXT(".glb"));
-			FMeshExportOptions Options;
-			Options.bIncludeTextures = !Steps[Index]->GetIO().bProducesTextures;
-			const FMeshExportResult Exported = FMeshExporter::ToGlbBytes(Loaded, Path, Input.MeshGlb, Options);
-			if (!Exported.bSuccess) { OutError = Exported.Error; return FGuid(); }
 		}
+		// A step that keeps its own edit of that input - the Garment Studio's sculpt - runs on the edit instead.
+		if (UStaticMesh* Edited = Steps[Index]->GetEditedInput(Loaded, From != INDEX_NONE, OutError))
+		{
+			Loaded = Edited;
+			FreshFrom[Index] = INDEX_NONE;
+		}
+		else if (!OutError.IsEmpty())
+		{
+			return FGuid();
+		}
+		else if (From != INDEX_NONE)
+		{
+			continue;
+		}
+		if (Loaded == nullptr)
+		{
+			if (!ResolvePostInput(Def, Input.MeshGlb, Input.SourceProviderId, Input.SourceTaskId, OutError,
+				Steps[Index]->StartsFromMeshStage() ? Steps[Index]->InputTakeId : FString())) return FGuid();
+
+			// Where the chain starts, origin and immediate source are the same thing, and the
+			// vendor's copy is still ours because nothing has run yet. A supplied mesh resolves to
+			// no provider and no id, so this correctly says "nobody made this, upload it".
+			Input.OriginProviderId     = Input.SourceProviderId;
+			Input.OriginTaskId         = Input.SourceTaskId;
+			Input.bVendorCopyIsCurrent = !Input.SourceTaskId.IsEmpty();
+			continue;
+		}
+
+		// A step pointed at an asset somebody chose by hand. Whatever that asset is, no vendor is
+		// holding a copy of it that we can name, so it uploads.
+		Input.OriginProviderId     = NAME_None;
+		Input.OriginTaskId.Reset();
+		Input.bVendorCopyIsCurrent = false;
+		const FString Path = FPaths::ProjectIntermediateDir() / TEXT("MeshForge/PostInputs")
+			/ (FGuid::NewGuid().ToString() + TEXT(".glb"));
+		FMeshExportOptions Options;
+		Options.bIncludeTextures = !Steps[Index]->GetIO().bProducesTextures;
+		const FMeshExportResult Exported = FMeshExporter::ToGlbBytes(Loaded, Path, Input.MeshGlb, Options);
+		if (!Exported.bSuccess) { OutError = Exported.Error; return FGuid(); }
 	}
 
 	// Copied for the same reason a concept draw copies its pipeline: the worker reads these settings
@@ -2293,6 +2529,11 @@ FGuid UMeshForgeSubsystem::StartPostProcessing(UMeshDef* Def, FString& OutError,
 
 	Jobs.Add(Job);
 
+	if (Continuation.Num() > 0)
+	{
+		PostContinuations.Add(Job.Id, Continuation);
+	}
+
 	FMeshStageState& State = Def->Stages.FindOrAdd(EMeshStage::Post);
 	State.Status = EMeshStageStatus::Running;
 	State.Error.Reset();
@@ -2301,11 +2542,11 @@ FGuid UMeshForgeSubsystem::StartPostProcessing(UMeshDef* Def, FString& OutError,
 
 	const FGuid JobId = Job.Id;
 	const FString Name = Def->GetName();
-	const FString Prompt = Def->Prompt;
+	const FString Prompt = Def->GetBrief();
 	const TSoftObjectPtr<UStaticMesh> PostSource{FSoftObjectPath(InputPaths[0])};
 
 	Async(EAsyncExecution::ThreadPool,
-		[JobId, Name, Prompt, Copies, PostSource, Inputs = MoveTemp(Inputs), Fresh, InputPaths]()
+		[JobId, Name, Prompt, Copies, PostSource, Inputs = MoveTemp(Inputs), FreshFrom, InputPaths]()
 	{
 		FMeshPostJob Work;
 		Work.Name             = Name;
@@ -2317,18 +2558,40 @@ FGuid UMeshForgeSubsystem::StartPostProcessing(UMeshDef* Def, FString& OutError,
 		for (int32 Index = 0; Index < Copies.Num(); ++Index)
 		{
 			UMeshPostPipeline* Step = Copies[Index];
-			if (!Fresh[Index]) Work = Inputs[Index];
+			const int32 From = FreshFrom[Index];
+			if (From == INDEX_NONE)
+			{
+				Work = Inputs[Index];
+			}
+			else if (From != Index - 1)
+			{
+				// An earlier step than the one just before: its result, not the one Work is carrying.
+				const FMeshPostResult& Source = Results[From];
+				Work = Inputs[Index];
+				Work.MeshGlb          = Source.MeshGlb;
+				Work.SourceProviderId = Source.PipelineProvider;
+				Work.SourceTaskId     = Source.TaskId;
+
+				// Lineage as it stood when that result was made, not as it stands now: this step is
+				// working on *that* mesh, so it must be told that mesh's history.
+				Work.OriginProviderId      = Source.OriginProviderId;
+				Work.OriginTaskId          = Source.OriginTaskId;
+				Work.bVendorCopyIsCurrent  = Source.bVendorCopyIsCurrent;
+			}
 			FMeshPostResult Result;
 			Step->Run(Work, Result);
-			Result.bNativeOutput = Step->ProducesSkeletalMesh();
+			Result.bNativeOutput = Step->IsNativeStep();
 			Result.StepId = Step->StepId;
-			Result.bUsesPreviousOutput = Fresh[Index];
+			Result.bUsesPreviousOutput = From != INDEX_NONE;
+			Result.FreshFromResult = From;
 			Result.InputAssetPath = InputPaths[Index];
+			// No fresh input and no asset means it read a generated take, whose MeshId is its source task id.
+			if (From == INDEX_NONE && InputPaths[Index].IsEmpty()) Result.StartTakeId = Inputs[Index].SourceTaskId;
 			Result.PipelineClass = Step->GetClass()->GetName();
 			Result.PipelineSignature = Step->Signature();
 			Result.PipelineProvider = Step->GetProviderId();
 			Result.VendorTaskId = Result.TaskId;
-			if (Fresh[Index]) Result.bKeepPlacement |= Results.Last().bKeepPlacement;
+			if (From != INDEX_NONE) Result.bKeepPlacement |= Results[From].bKeepPlacement;
 			else if (!InputPaths[Index].IsEmpty()) Result.bKeepPlacement = true;
 
 			if (!Result.IsOk())
@@ -2349,6 +2612,31 @@ FGuid UMeshForgeSubsystem::StartPostProcessing(UMeshDef* Def, FString& OutError,
 			Work.MeshGlb          = Result.MeshGlb;
 			Work.SourceProviderId = Step->GetProviderId();
 			Work.SourceTaskId     = Result.TaskId;
+
+			// **Origin is only written by a step that actually produced a vendor handle.** The two
+			// fields above are overwritten every time and so answer "what ran last"; these keep
+			// answering "what made this". Without the distinction a garment fit - local, no task id -
+			// erased the fact that the shirt came from Tripo at all.
+			if (!Result.TaskId.IsEmpty())
+			{
+				Work.OriginProviderId     = Step->GetProviderId();
+				Work.OriginTaskId         = Result.TaskId;
+				Work.bVendorCopyIsCurrent = true;
+			}
+
+			// And any step that moved a vertex means the vendor's copy is no longer ours, whoever
+			// made it. The handle stays - it is still where this came from - but it stops being a
+			// shortcut, because using it would fetch the vendor's mesh instead of the one we hold.
+			if (Step->GetIO().bChangesGeometry)
+			{
+				Work.bVendorCopyIsCurrent = false;
+			}
+
+			// Carried onto the result so a later step that reaches back to this one (Starts from -
+			// a step's output) is told this mesh's history rather than the chain's latest.
+			Result.OriginProviderId     = Work.OriginProviderId;
+			Result.OriginTaskId         = Work.OriginTaskId;
+			Result.bVendorCopyIsCurrent = Work.bVendorCopyIsCurrent;
 
 			Results.Add(MoveTemp(Result));
 		}
@@ -2498,7 +2786,7 @@ bool UMeshForgeSubsystem::FinishPostRun(
 		Record.DefinitionPath = Def->GetPathName();
 		Record.DefinitionName = Def->GetName();
 
-		Record.Prompt = Def->Prompt;
+		Record.Prompt = Def->GetBrief();
 
 		// What went in. Named as the asset where somebody supplied one, as the take it came from
 		// where the pipeline made it - a record that cannot say which is a record nobody can audit.
@@ -2509,7 +2797,18 @@ bool UMeshForgeSubsystem::FinishPostRun(
 			Input.AssetPath = Def->SourceMesh.ToString();
 			Record.Inputs.Add(Input);
 		}
-		else if (const FMeshCandidate* From = Def->FindSelectedCandidate())
+		else if (const FMeshCandidate* From = [Def, &Steps]()
+			{
+				// The take the chain actually read, which is not the selected one when a step was pointed at another.
+				for (const FMeshPostResult& Step : Steps)
+				{
+					if (!Step.StartTakeId.IsEmpty())
+					{
+						if (const FMeshCandidate* Named = Def->FindCandidate(Step.StartTakeId)) { return Named; }
+					}
+				}
+				return Def->FindSelectedCandidate();
+			}())
 		{
 			FForgeTakeInput Input;
 			Input.Role = TEXT("source-take");
@@ -2679,6 +2978,7 @@ void UMeshForgeSubsystem::FinishPostChain(const FGuid& JobId,
 	UMeshDef* Def = Job ? Job->Definition.Get() : nullptr;
 	if (!Def) { FinishJob(JobId, false, TEXT("The definition is no longer available.")); return; }
 	TSoftObjectPtr<UObject> Previous(Source.ToSoftObjectPath());
+	TArray<TSoftObjectPtr<UObject>> Produced;   // each result's asset, by result index, for inputs that name an earlier one
 	FString Failure;
 	for (int32 Index = 0; Index < Results.Num(); ++Index)
 	{
@@ -2686,13 +2986,89 @@ void UMeshForgeSubsystem::FinishPostChain(const FGuid& JobId,
 		UMeshPostPipeline* Pipeline = Pipelines[Index];
 		if (!Result.IsOk()) { Failure = Result.Error; break; }
 		if (!Result.bUsesPreviousOutput) Previous = TSoftObjectPtr<UObject>(FSoftObjectPath(Result.InputAssetPath));
+		else if (Produced.IsValidIndex(Result.FreshFromResult)) Previous = Produced[Result.FreshFromResult];
 		FMeshPostOutput Output;
 		Output.StepId = Result.StepId;
 		Output.TakeId = FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower);
-		Output.Step = Pipeline->GetClass()->GetDisplayNameText().ToString();
+		Output.Step = Pipeline->GetStepDisplayName().ToString();
 		Output.Input = Previous;
 		Output.CreatedUtc = FDateTime::UtcNow();
-		if (!Pipeline->ProducesSkeletalMesh())
+		if (!Pipeline->IsNativeStep() && Result.OutputStaticMesh.IsValid())
+		{
+			// Already a saved asset, made in the editor: recorded as it stands, so nothing about it changes.
+			UStaticMesh* Mesh = Cast<UStaticMesh>(Result.OutputStaticMesh.TryLoad());
+			if (Mesh == nullptr)
+			{
+				Failure = FString::Printf(TEXT("'%s' named '%s' as its result, which could not be loaded."),
+					*Output.Step, *Result.OutputStaticMesh.ToString());
+				break;
+			}
+
+			FMeshImportOutcome Outcome;
+			Outcome.bSuccess = true;
+			Outcome.Mesh = Mesh;
+			Outcome.BoundsSize = Mesh->GetBoundingBox().GetSize();
+			Outcome.bNaniteEnabled = Mesh->IsNaniteEnabled();
+			Outcome.LodCount = Mesh->GetNumSourceModels();
+			if (const FMeshDescription* Description = Mesh->GetMeshDescription(0))
+			{
+				Outcome.VertexCount = Description->Vertices().Num();
+				Outcome.TriangleCount = Description->Triangles().Num();
+				Outcome.SourceUVChannels = FStaticMeshConstAttributes(*Description).GetVertexInstanceUVs().GetNumChannels();
+			}
+			if (const UBodySetup* Body = Mesh->GetBodySetup())
+			{
+				Outcome.CollisionPrimitives = Body->AggGeom.GetElementCount();
+			}
+			for (const FStaticMaterial& Material : Mesh->GetStaticMaterials()) Outcome.Materials.Add(Material.MaterialInterface);
+
+			Def->ImportedMesh = Mesh;
+			Def->LastImport = Outcome;
+			FMeshStageState& ImportStage = Def->Stages.FindOrAdd(EMeshStage::Import);
+			ImportStage.Status = EMeshStageStatus::Ready;
+			ImportStage.LastRunUtc = FDateTime::UtcNow();
+			ImportStage.InputsHash = Def->ComputeStageHash(EMeshStage::Import);
+			ImportStage.Error.Reset();
+
+			FForgeTakeRecord Record;
+			Record.TakeId = Output.TakeId;
+			Record.Plugin = TEXT("MeshForge");
+			Record.Kind = TEXT("static-mesh-post");
+			Record.Directory = FForgeLibrary::TakeDirectory(Record.Plugin, Def->GetName(), Output.TakeId);
+			IFileManager::Get().MakeDirectory(*Record.Directory, true);
+			Record.DefinitionPath = Def->GetPathName();
+			Record.DefinitionName = Def->GetName();
+			Record.Prompt = Def->GetBrief();
+			Record.ProviderId = Pipeline->GetProviderId().ToString();
+			Record.Settings.Add(TEXT("pipelineClass"), Result.PipelineClass);
+			Record.Settings.Add(TEXT("pipelineSettings"), Result.PipelineSignature);
+			Record.Settings.Add(TEXT("outputAsset"), Mesh->GetPathName());
+			Record.StartedUtc = Output.CreatedUtc;
+			Record.FinishedUtc = FDateTime::UtcNow();
+			Record.Seconds = Result.Seconds;
+			if (!Previous.IsNull())
+			{
+				FForgeTakeInput InputRecord;
+				InputRecord.Role = TEXT("preceding-output");
+				InputRecord.AssetPath = Previous.ToString();
+				Record.Inputs.Add(InputRecord);
+			}
+			if (!Result.Summary.IsEmpty())
+			{
+				FForgeProcessingEvent Event;
+				Event.StepId = TEXT("meshforge.post");
+				Event.Tool = TEXT("MeshForge");
+				Event.AtUtc = FDateTime::UtcNow();
+				Event.Summary = Result.Summary;
+				Record.Processing.Add(Event);
+			}
+			FString RecordError;
+			if (!FForgeLibrary::WriteRecord(Record, RecordError)) UE_LOG(LogMeshForge, Warning, TEXT("%s"), *RecordError);
+			UE_LOG(LogMeshForge, Log, TEXT("'%s': %s made %s. %s"), *Def->GetName(), *Output.Step, *Mesh->GetPathName(), *Result.Summary);
+
+			Output.Asset = TSoftObjectPtr<UObject>(FSoftObjectPath(Mesh));
+		}
+		else if (!Pipeline->IsNativeStep())
 		{
 			FMeshPostResult Filed = Result;
 			Filed.TaskId = Output.TakeId;
@@ -2704,14 +3080,72 @@ void UMeshForgeSubsystem::FinishPostChain(const FGuid& JobId,
 		else
 		{
 			const double NativeStarted = FPlatformTime::Seconds();
-			UStaticMesh* Input = Cast<UStaticMesh>(Previous.LoadSynchronous());
-			if (!Input) { Failure = TEXT("The preceding step did not produce a static mesh."); break; }
-			const FString Path = UMeshForgeSettings::Get()->GetPostTakeFolder(Def->GetName(), Output.TakeId)
-				/ FString::Printf(TEXT("SK_%s"), *Def->GetName().Replace(TEXT("MSD_"), TEXT("")));
-			USkeletalMesh* Mesh = Pipeline->CreateSkeletalOutput(Input, Path, Failure);
-			if (!Mesh || !Failure.IsEmpty()) { if (Failure.IsEmpty()) Failure = TEXT("Skeletal creation produced no asset."); break; }
+			UObject* Input = Previous.LoadSynchronous();
+			if (!Input || !Pipeline->AcceptsNativeInput(Input->GetClass()))
+			{
+				Failure = FString::Printf(TEXT("'%s' cannot work on %s."), *Output.Step,
+					Input ? *FString::Printf(TEXT("a %s"), *Input->GetClass()->GetName()) : TEXT("a missing asset"));
+				break;
+			}
+			FMeshPostNativeContext Native;
+			Native.AssetPath = UMeshForgeSettings::Get()->GetPostTakeFolder(Def->GetName(), Output.TakeId)
+				/ (Pipeline->GetNativeOutputPrefix() + Def->GetName().Replace(TEXT("MSD_"), TEXT("")));
+			Native.DefinitionName = Def->GetName();
+			Native.DefinitionPath = Def->GetPathName();
+			Native.Prompt = Def->GetBrief();
+			for (int32 Earlier = Def->PostOutputs.Num() - 1; Earlier >= 0; --Earlier)
+			{
+				if (Def->PostOutputs[Earlier].Asset.ToSoftObjectPath() == Previous.ToSoftObjectPath())
+				{
+					Native.InputMadeFrom = Def->PostOutputs[Earlier].Input.ToSoftObjectPath();
+					break;
+				}
+			}
+			UObject* Made = Pipeline->CreateNativeOutput(Input, Native, Failure);
+			if (!Made || !Failure.IsEmpty()) { if (Failure.IsEmpty()) Failure = FString::Printf(TEXT("'%s' produced no asset."), *Output.Step); break; }
+			Output.Asset = Made;
+			USkeletalMesh* Mesh = Cast<USkeletalMesh>(Made);
+			if (!Mesh)
+			{
+				// An asset that is not a mesh - an inventory item, say - is recorded, and leaves the
+				// definition's import state alone: nothing was imported.
+				FForgeTakeRecord Record;
+				Record.TakeId = Output.TakeId;
+				Record.Plugin = TEXT("MeshForge");
+				Record.Kind = TEXT("asset-post");
+				Record.Directory = FForgeLibrary::TakeDirectory(Record.Plugin, Def->GetName(), Output.TakeId);
+				IFileManager::Get().MakeDirectory(*Record.Directory, true);
+				Record.DefinitionPath = Def->GetPathName();
+				Record.DefinitionName = Def->GetName();
+				Record.ProviderId = Pipeline->GetProviderId().ToString();
+				Record.Settings.Add(TEXT("pipeline"), Pipeline->Signature());
+				Record.Settings.Add(TEXT("outputAsset"), Made->GetPathName());
+				Record.StartedUtc = Output.CreatedUtc;
+				Record.FinishedUtc = FDateTime::UtcNow();
+				Record.Seconds = float(FPlatformTime::Seconds() - NativeStarted);
+				FForgeTakeInput InputRecord;
+				InputRecord.Role = TEXT("preceding-output");
+				InputRecord.AssetPath = Input->GetPathName();
+				Record.Inputs.Add(InputRecord);
+				if (!Native.Summary.IsEmpty())
+				{
+					FForgeProcessingEvent Event;
+					Event.StepId = TEXT("meshforge.post");
+					Event.Tool = TEXT("MeshForge");
+					Event.AtUtc = FDateTime::UtcNow();
+					Event.Summary = Native.Summary;
+					Record.Processing.Add(Event);
+				}
+				FString RecordError;
+				if (!FForgeLibrary::WriteRecord(Record, RecordError)) UE_LOG(LogMeshForge, Warning, TEXT("%s"), *RecordError);
+				UE_LOG(LogMeshForge, Log, TEXT("'%s': %s made %s. %s"), *Def->GetName(), *Output.Step, *Made->GetPathName(), *Native.Summary);
+				Previous = Output.Asset;
+				Produced.Add(Output.Asset);
+				Def->PostOutputs.Add(Output);
+				Def->MarkPackageDirty();
+				continue;
+			}
 			Def->ImportedSkeletalMesh = Mesh;
-			Output.Asset = Mesh;
 			FMeshImportOutcome NativeOutcome;
 			NativeOutcome.bSuccess = true;
 			NativeOutcome.SkeletalMesh = Mesh;
@@ -2752,6 +3186,7 @@ void UMeshForgeSubsystem::FinishPostChain(const FGuid& JobId,
 			if (!FForgeLibrary::WriteRecord(Record, RecordError)) UE_LOG(LogMeshForge, Warning, TEXT("%s"), *RecordError);
 		}
 		Previous = Output.Asset;
+		Produced.Add(Output.Asset);
 		Def->PostOutputs.Add(Output);
 		Def->MarkPackageDirty();
 	}
@@ -2763,6 +3198,427 @@ void UMeshForgeSubsystem::FinishPostChain(const FGuid& JobId,
 	Def->SetStatus(Failure.IsEmpty() ? EMeshDefStatus::Imported : EMeshDefStatus::Failed, Failure);
 	Def->MarkPackageDirty();
 	FinishJob(JobId, Failure.IsEmpty(), Failure);
+
+	TArray<int32> Rest;
+	if (PostContinuations.RemoveAndCopyValue(JobId, Rest) && Failure.IsEmpty() && Rest.Num() > 0)
+	{
+		ContinuePostChain(Def, Rest);
+	}
+}
+
+void UMeshForgeSubsystem::ContinuePostChain(UMeshDef* Def, const TArray<int32>& Rest)
+{
+	TWeakObjectPtr<UMeshDef> WeakDef = Def;
+
+	FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([WeakDef, Rest](float) -> bool
+	{
+		UMeshDef* Live = WeakDef.Get();
+		UMeshForgeSubsystem* Self = UMeshForgeSubsystem::Get();
+
+		if (Live != nullptr && Self != nullptr)
+		{
+			FString Error;
+			if (!Self->StartPostSteps(Live, Rest, Error).IsValid())
+			{
+				// Said on the stage, because nothing else is watching: the job that would have carried
+				// the message never started.
+				UE_LOG(LogMeshForge, Error, TEXT("'%s': the rest of the post chain could not start - %s"), *Live->GetName(), *Error);
+				FMeshStageState& Stage = Live->Stages.FindOrAdd(EMeshStage::Post);
+				Stage.Status = EMeshStageStatus::Failed;
+				Stage.Error  = Error;
+				Live->SetStatus(EMeshDefStatus::Failed, Error);
+			}
+		}
+
+		return false;   // once
+	}), 0.0f);
+}
+
+// ---- steps a person finishes -----------------------------------------------------------------------
+
+FGuid UMeshForgeSubsystem::BeginInteractiveStep(UMeshDef* Def, int32 StepIndex,
+	const TArray<int32>& Continuation, FString& OutError)
+{
+	UMeshPostPipeline* Step = Def->PostPipelines.IsValidIndex(StepIndex) ? Def->PostPipelines[StepIndex].Get() : nullptr;
+
+	if (Step == nullptr)
+	{
+		OutError = TEXT("This step no longer exists.");
+		return FGuid();
+	}
+
+	TSoftObjectPtr<UObject> Input;
+	if (!ResolvePostStepMesh(Def, StepIndex, Input, OutError))
+	{
+		return FGuid();
+	}
+
+	FMeshPostInteractiveSession Session;
+	Session.Id             = FGuid::NewGuid();
+	Session.DefinitionName = Def->GetName();
+	Session.Directory      = FPaths::ConvertRelativePathToFull(FPaths::ProjectIntermediateDir()
+		/ TEXT("MeshForge/Interactive") / Def->GetName() / Session.Id.ToString(EGuidFormats::DigitsWithHyphensLower));
+	Session.InputGlb       = Session.Directory / TEXT("input.glb");
+
+	IFileManager::Get().MakeDirectory(*Session.Directory, true);
+
+	if (!Step->WantsInteractiveInputGlb())
+	{
+		// Edited inside the editor: the step works on the asset, so nothing is written for another program.
+		if (UObject* Asset = Input.IsNull() ? nullptr : Input.LoadSynchronous())
+		{
+			Session.InputAssetPath = Asset->GetPathName();
+		}
+	}
+	else if (Input.IsNull())
+	{
+		// The generated take itself, straight from the vault.
+		TArray<uint8> Bytes;
+		FName ProviderId;
+		FString TaskId;
+
+		if (!ResolvePostInput(Def, Bytes, ProviderId, TaskId, OutError,
+			Step->StartsFromMeshStage() ? Step->InputTakeId : FString()))
+		{
+			return FGuid();
+		}
+
+		if (!FFileHelper::SaveArrayToFile(Bytes, *Session.InputGlb))
+		{
+			OutError = FString::Printf(TEXT("Could not write the mesh to '%s'."), *Session.InputGlb);
+			return FGuid();
+		}
+	}
+	else
+	{
+		UStaticMesh* Mesh = Cast<UStaticMesh>(Input.LoadSynchronous());
+
+		if (Mesh == nullptr)
+		{
+			OutError = FString::Printf(TEXT("'%s' works on a static mesh. Choose one as its input."),
+				*Step->GetStepDisplayName().ToString());
+			return FGuid();
+		}
+
+		Session.InputAssetPath = Mesh->GetPathName();
+
+		// With textures: this file is for a person to look at, not for a service about to repaint it.
+		FMeshExportOptions Options;
+		Options.bIncludeTextures = true;
+
+		const FMeshExportResult Exported = FMeshExporter::ToGlb(Mesh, Session.InputGlb, Options);
+		if (!Exported.bSuccess)
+		{
+			OutError = Exported.Error;
+			return FGuid();
+		}
+	}
+
+	// Written before the step starts, so a result sent back after a restart can be traced to its input.
+	{
+		TSharedRef<FJsonObject> Record = MakeShared<FJsonObject>();
+		Record->SetStringField(TEXT("id"), Session.Id.ToString(EGuidFormats::DigitsWithHyphensLower));
+		Record->SetStringField(TEXT("definition"), Session.DefinitionName);
+		Record->SetStringField(TEXT("inputAsset"), Session.InputAssetPath);
+
+		FString Text;
+		const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Text);
+		FJsonSerializer::Serialize(Record, Writer);
+		FFileHelper::SaveStringToFile(Text, *(Session.Directory / TEXT("meshforge-session.json")));
+	}
+
+	if (!Step->StepId.IsValid())
+	{
+		Step->Modify();
+		Step->StepId = FGuid::NewGuid();
+	}
+
+	if (!Step->BeginInteractive(Session, OutError))
+	{
+		return FGuid();
+	}
+
+	Step->Modify();
+	Step->InteractiveSessionDirectory = Session.Directory;
+	Def->MarkPackageDirty();
+
+	return WaitForInteractive(Def, StepIndex, Session, Continuation);
+}
+
+FGuid UMeshForgeSubsystem::WaitForInteractive(UMeshDef* Def, int32 StepIndex,
+	const FMeshPostInteractiveSession& Session, const TArray<int32>& Continuation)
+{
+	UMeshPostPipeline* Step = Def->PostPipelines[StepIndex];
+
+	FMeshForgeJob Job;
+	Job.Id             = FGuid::NewGuid();
+	Job.Definition     = Def;
+	Job.DefinitionName = Def->GetName();
+	Job.Stage          = EMeshStage::Post;
+	Job.Label          = FString::Printf(TEXT("Waiting for your edit: %s"), *Step->GetStepDisplayName().ToString());
+	Job.State          = EMeshForgeJobState::Running;
+	Job.StartedUtc     = FDateTime::UtcNow();
+	Job.StartedSeconds = FPlatformTime::Seconds();
+	Jobs.Add(Job);
+
+	FMeshStageState& State = Def->Stages.FindOrAdd(EMeshStage::Post);
+	State.Status = EMeshStageStatus::Running;
+	State.Error.Reset();
+
+	FInteractiveWait& Wait = InteractiveWaits.AddDefaulted_GetRef();
+	Wait.JobId          = Job.Id;
+	Wait.Definition     = Def;
+	Wait.Step           = Step;
+	Wait.Session        = Session;
+	Wait.Continuation   = Continuation;
+	Wait.StartedSeconds = Job.StartedSeconds;
+
+	if (!InteractiveHandle.IsValid())
+	{
+		InteractiveHandle = FTSTicker::GetCoreTicker().AddTicker(
+			FTickerDelegate::CreateUObject(this, &UMeshForgeSubsystem::PollInteractiveSteps), 0.5f);
+	}
+
+	UE_LOG(LogMeshForge, Log, TEXT("'%s': waiting on %s (session %s)."),
+		*Def->GetName(), *Step->GetStepDisplayName().ToString(), *Session.Directory);
+
+	OnJobsChanged.Broadcast();
+	return Job.Id;
+}
+
+bool UMeshForgeSubsystem::PollInteractiveSteps(float DeltaTime)
+{
+	// Backwards, and over a copy of each entry: finishing one imports, and may start another wait.
+	for (int32 Index = InteractiveWaits.Num() - 1; Index >= 0; --Index)
+	{
+		if (!InteractiveWaits.IsValidIndex(Index))
+		{
+			continue;
+		}
+
+		const FInteractiveWait Wait = InteractiveWaits[Index];
+		const UMeshPostPipeline* Step = Wait.Step.Get();
+
+		if (Wait.Definition.Get() == nullptr || Step == nullptr)
+		{
+			InteractiveWaits.RemoveAt(Index);
+			PostContinuations.Remove(Wait.JobId);
+			FinishJob(Wait.JobId, false, TEXT("The definition or its step went away while waiting."));
+			continue;
+		}
+
+		FString ResultGlb, Summary, Error;
+		const EMeshInteractiveState State = Step->PollInteractive(Wait.Session, ResultGlb, Summary, Error);
+
+		if (State == EMeshInteractiveState::Waiting)
+		{
+			continue;
+		}
+
+		InteractiveWaits.RemoveAt(Index);
+
+		if (State == EMeshInteractiveState::Failed)
+		{
+			PostContinuations.Remove(Wait.JobId);
+			FinishJob(Wait.JobId, false, Error);
+			continue;
+		}
+
+		FinishInteractiveStep(Wait, ResultGlb, Summary);
+	}
+
+	if (InteractiveWaits.Num() == 0)
+	{
+		InteractiveHandle.Reset();
+		return false;
+	}
+
+	return true;
+}
+
+void UMeshForgeSubsystem::FinishInteractiveStep(const FInteractiveWait& Wait, const FString& ResultGlb, const FString& Summary)
+{
+	UMeshDef* Def = Wait.Definition.Get();
+	UMeshPostPipeline* Step = Wait.Step.Get();
+
+	// A step that edited an asset in the editor hands that asset back; everything else hands back a file.
+	FSoftObjectPath ResultAsset;
+	const bool bAssetResult = Step != nullptr && Step->GetInteractiveResultAsset(Wait.Session, ResultAsset);
+
+	TArray<uint8> Bytes;
+	if (Def == nullptr || Step == nullptr)
+	{
+		FinishJob(Wait.JobId, false, TEXT("The definition or its step went away before the result could be taken."));
+		return;
+	}
+	if (bAssetResult ? Cast<UStaticMesh>(ResultAsset.TryLoad()) == nullptr
+		: (!FFileHelper::LoadFileToArray(Bytes, *ResultGlb) || Bytes.Num() == 0))
+	{
+		FinishJob(Wait.JobId, false, FString::Printf(TEXT("The result at '%s' could not be read."),
+			bAssetResult ? *ResultAsset.ToString() : *ResultGlb));
+		return;
+	}
+
+	// Taken before importing, so a slow import cannot see the same result twice.
+	Step->ConsumeInteractiveResult(Wait.Session);
+
+	FMeshPostResult Result;
+	Result.MeshGlb             = MoveTemp(Bytes);
+	Result.OutputStaticMesh    = bAssetResult ? ResultAsset : FSoftObjectPath();
+	Result.StepId              = Step->StepId;
+	Result.bUsesPreviousOutput = false;
+	Result.InputAssetPath      = Wait.Session.InputAssetPath;
+	Result.PipelineClass       = Step->GetClass()->GetName();
+	Result.PipelineSignature   = Step->Signature();
+	Result.PipelineProvider    = Step->GetProviderId();
+	Result.Summary             = Summary;
+	Result.ConsumedCredits     = 0;
+	Result.bKeepPlacement      = true;
+	Result.Seconds             = static_cast<float>(FPlatformTime::Seconds() - Wait.StartedSeconds);
+
+	if (Wait.Continuation.Num() > 0)
+	{
+		PostContinuations.Add(Wait.JobId, Wait.Continuation);
+	}
+
+	const int32 OutputsBefore = Def->PostOutputs.Num();
+
+	// Continuation, if any, is scheduled for the next tick inside this - after the material pass below.
+	FinishPostChain(Wait.JobId, TArray<UMeshPostPipeline*>{ Step }, TArray<FMeshPostResult>{ Result }, FString(),
+		TSoftObjectPtr<UStaticMesh>(FSoftObjectPath(Wait.Session.InputAssetPath)));
+
+	if (Def->PostOutputs.Num() > OutputsBefore)
+	{
+		UStaticMesh* Output = Cast<UStaticMesh>(Def->PostOutputs.Last().Asset.LoadSynchronous());
+		UObject* Input = Wait.Session.InputAssetPath.IsEmpty() ? nullptr : FSoftObjectPath(Wait.Session.InputAssetPath).TryLoad();
+
+		if (Output != nullptr)
+		{
+			Step->OnInteractiveOutputImported(Output, Input);
+		}
+	}
+}
+
+bool UMeshForgeSubsystem::LoadInteractiveSession(const FString& Directory, FMeshPostInteractiveSession& OutSession)
+{
+	FString Text;
+	TSharedPtr<FJsonObject> Record;
+
+	if (!FFileHelper::LoadFileToString(Text, *(Directory / TEXT("meshforge-session.json")))
+		|| !FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Text), Record) || !Record.IsValid())
+	{
+		return false;
+	}
+
+	FGuid::Parse(Record->GetStringField(TEXT("id")), OutSession.Id);
+	OutSession.Directory      = Directory;
+	OutSession.InputGlb       = Directory / TEXT("input.glb");
+	OutSession.InputAssetPath = Record->GetStringField(TEXT("inputAsset"));
+	OutSession.DefinitionName = Record->GetStringField(TEXT("definition"));
+	return true;
+}
+
+bool UMeshForgeSubsystem::IsWaitingForInteractive(const UMeshDef* Def, int32 StepIndex) const
+{
+	const UMeshPostPipeline* Step = Def && Def->PostPipelines.IsValidIndex(StepIndex) ? Def->PostPipelines[StepIndex].Get() : nullptr;
+
+	return Step != nullptr && InteractiveWaits.ContainsByPredicate([Def, Step](const FInteractiveWait& Wait)
+	{
+		return Wait.Definition.Get() == Def && Wait.Step.Get() == Step;
+	});
+}
+
+bool UMeshForgeSubsystem::HasUnclaimedInteractiveResult(const UMeshDef* Def, int32 StepIndex) const
+{
+	const UMeshPostPipeline* Step = Def && Def->PostPipelines.IsValidIndex(StepIndex) ? Def->PostPipelines[StepIndex].Get() : nullptr;
+
+	if (Step == nullptr || !Step->IsInteractiveStep() || Step->InteractiveSessionDirectory.IsEmpty()
+		|| IsWaitingForInteractive(Def, StepIndex))
+	{
+		return false;
+	}
+
+	FMeshPostInteractiveSession Session;
+	FString ResultGlb, Summary, Error;
+	return LoadInteractiveSession(Step->InteractiveSessionDirectory, Session)
+		&& Step->PollInteractive(Session, ResultGlb, Summary, Error) == EMeshInteractiveState::Done;
+}
+
+FGuid UMeshForgeSubsystem::PickUpInteractiveResult(UMeshDef* Def, int32 StepIndex, FString& OutError)
+{
+	if (!HasUnclaimedInteractiveResult(Def, StepIndex))
+	{
+		OutError = TEXT("There is no result waiting to be picked up for this step.");
+		return FGuid();
+	}
+
+	if (IsStageRunning(Def, EMeshStage::Post) || Def->IsBusy())
+	{
+		OutError = TEXT("Wait for the current job to finish.");
+		return FGuid();
+	}
+
+	FMeshPostInteractiveSession Session;
+	LoadInteractiveSession(Def->PostPipelines[StepIndex]->InteractiveSessionDirectory, Session);
+
+	// A wait whose result is already there: the next poll finds it and imports it.
+	return WaitForInteractive(Def, StepIndex, Session, TArray<int32>());
+}
+
+void UMeshForgeSubsystem::StopWaitingForInteractive(UMeshDef* Def)
+{
+	for (int32 Index = InteractiveWaits.Num() - 1; Index >= 0; --Index)
+	{
+		if (InteractiveWaits[Index].Definition.Get() != Def)
+		{
+			continue;
+		}
+
+		const FGuid JobId = InteractiveWaits[Index].JobId;
+		InteractiveWaits.RemoveAt(Index);
+		PostContinuations.Remove(JobId);
+		FinishJob(JobId, false,
+			TEXT("Stopped waiting. The edit stays open; finish it whenever you like and pick the result up from the step."));
+	}
+}
+
+bool UMeshForgeSubsystem::SendInteractiveCommand(const UMeshDef* Def, int32 StepIndex, const FString& Command, FString& OutReply) const
+{
+	const UMeshPostPipeline* Step = Def && Def->PostPipelines.IsValidIndex(StepIndex) ? Def->PostPipelines[StepIndex].Get() : nullptr;
+
+	if (Step == nullptr || !Step->TakesCommands())
+	{
+		OutReply = TEXT("That is not a step a person finishes, so it takes no commands.");
+		return false;
+	}
+
+	const FInteractiveWait* Wait = InteractiveWaits.FindByPredicate([Def, Step](const FInteractiveWait& Candidate)
+	{
+		return Candidate.Definition.Get() == Def && Candidate.Step.Get() == Step;
+	});
+
+	// The session the chain is waiting on, or else the last one the step started. A step with a window of its
+	// own answers without one.
+	FMeshPostInteractiveSession Session;
+	bool bHasSession = false;
+
+	if (Wait != nullptr)
+	{
+		Session = Wait->Session;
+		bHasSession = true;
+	}
+	else if (!Step->InteractiveSessionDirectory.IsEmpty())
+	{
+		bHasSession = LoadInteractiveSession(Step->InteractiveSessionDirectory, Session);
+	}
+
+	if (!bHasSession && Step->CommandsNeedSession())
+	{
+		OutReply = TEXT("This step has not started a session yet. Run it first.");
+		return false;
+	}
+
+	return Step->HandleInteractiveCommand(bHasSession ? Session : FMeshPostInteractiveSession(), Command, OutReply);
 }
 
 void UMeshForgeSubsystem::FileFailedTakes(UMeshDef* Def)

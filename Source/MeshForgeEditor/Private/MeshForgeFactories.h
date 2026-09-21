@@ -29,6 +29,43 @@ public:
 
 	UMeshDefFactory();
 
+	/**
+	 * Ask which workflow the new definition starts from: Blank, or one of the project's Mesh Workflows,
+	 * with the project default first. Skipped when the project has none. Closing the window cancels.
+	 */
+	virtual bool ConfigureProperties() override;
+
+	virtual UObject* FactoryCreateNew(
+		UClass* Class,
+		UObject* InParent,
+		FName Name,
+		EObjectFlags Flags,
+		UObject* Context,
+		FFeedbackContext* Warn) override;
+
+	virtual FText GetDisplayName() const override;
+	virtual FString GetDefaultNewAssetName() const override;
+
+private:
+	/** The workflow chosen in ConfigureProperties. Empty is Blank. */
+	FSoftObjectPath ChosenWorkflow;
+};
+
+/**
+ * Creates an empty Mesh Workflow.
+ *
+ * Usually the long way round: a workflow is easiest made from a definition set up in its panel, with Save
+ * as Workflow. This is here so the asset type has the family's menu entry like every other.
+ */
+UCLASS()
+class UMeshWorkflowFactory : public UFactory
+{
+	GENERATED_BODY()
+
+public:
+
+	UMeshWorkflowFactory();
+
 	virtual UObject* FactoryCreateNew(
 		UClass* Class,
 		UObject* InParent,

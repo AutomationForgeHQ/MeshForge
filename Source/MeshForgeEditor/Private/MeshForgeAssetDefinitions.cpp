@@ -4,6 +4,7 @@
 
 #include "MeshDef.h"
 #include "MeshDefEditorToolkit.h"
+#include "MeshWorkflow.h"
 
 #include "MeshDef.h"
 
@@ -56,5 +57,25 @@ EAssetCommandResult UMeshDefAssetDefinition::OpenAssets(const FAssetOpenArgs& Op
 	return EAssetCommandResult::Handled;
 }
 
+
+FText UMeshWorkflowAssetDefinition::GetAssetDisplayName() const
+{
+	return LOCTEXT("MeshWorkflow", "Mesh Workflow");
+}
+
+FLinearColor UMeshWorkflowAssetDefinition::GetAssetColor() const
+{
+	return FLinearColor(0.95f, 0.72f, 0.45f);
+}
+
+TSoftClassPtr<UObject> UMeshWorkflowAssetDefinition::GetAssetClass() const
+{
+	return UMeshWorkflow::StaticClass();
+}
+
+TConstArrayView<FAssetCategoryPath> UMeshWorkflowAssetDefinition::GetAssetCategories() const
+{
+	return ForgeCategories();
+}
 
 #undef LOCTEXT_NAMESPACE

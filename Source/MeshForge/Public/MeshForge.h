@@ -2,6 +2,7 @@
 
 #include "Modules/ModuleManager.h"
 #include "Logging/LogMacros.h"
+#include "MeshForgeExtensions.h"
 
 class IMeshProvider;
 
@@ -25,7 +26,7 @@ MESHFORGE_API DECLARE_LOG_CATEGORY_EXTERN(LogMeshForge, Log, All);
  * first-party mesh service to register - every provider is an add-on. That makes the empty registry
  * a normal state rather than a fault, and the editor says so plainly instead of reporting an error.
  */
-class MESHFORGE_API FMeshForgeModule : public IModuleInterface
+class MESHFORGE_API FMeshForgeModule : public IMeshForgeExtensionsModule
 {
 public:
 
@@ -68,7 +69,24 @@ public:
 	DECLARE_MULTICAST_DELEGATE(FOnProvidersChanged);
 	FOnProvidersChanged OnProvidersChanged;
 
+	// --- post steps offered by plugins that do not link MeshForge ---------------------------------
+
+	virtual void RegisterPostStepType(const FMeshForgePostStepType& Type) override;
+	virtual void UnregisterPostStepType(FName Id) override;
+
+	/** The registered step with this id, or null when its plugin is absent. */
+	const FMeshForgePostStepType* FindPostStepType(FName Id) const;
+
+	/** Every registered step, in display-name order. */
+	TArray<const FMeshForgePostStepType*> GetPostStepTypes() const;
+
+	DECLARE_MULTICAST_DELEGATE(FOnPostStepTypesChanged);
+	FOnPostStepTypesChanged OnPostStepTypesChanged;
+
 private:
 
 	TMap<FName, TSharedPtr<IMeshProvider>> Providers;
+
+	/** Shared pointers so an entry handed to a caller survives another plugin registering meanwhile. */
+	TMap<FName, TSharedRef<FMeshForgePostStepType>> PostStepTypes;
 };

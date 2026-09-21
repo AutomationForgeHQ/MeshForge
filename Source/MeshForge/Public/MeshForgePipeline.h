@@ -26,6 +26,26 @@ enum class EMeshPipelineKind : uint8
 };
 
 /**
+ * What a mesh pipeline builds from: words, pictures, or whichever the definition has.
+ *
+ * **Declared by a pipeline whose vendor sells text and pictures as separate requests.** Left to the
+ * definition, the choice was made by accident - a main picture anywhere in the gallery quietly turned
+ * a text request into an image one and dropped the prompt - and nothing on screen said which ran.
+ */
+UENUM(BlueprintType)
+enum class EMeshPipelineInput : uint8
+{
+	/** The picture when there is one, the words when there is not. Every pipeline before this existed. */
+	Either,
+
+	/** Words only. The definition's pictures are not sent, however many it holds. */
+	Text,
+
+	/** Pictures only. The words are not sent, and generating without a main picture is refused. */
+	Image,
+};
+
+/**
  * What a pipeline needs and what it hands on.
  *
  * Declared so a stage can refuse an impossible chain before it is run rather than after: a
@@ -61,6 +81,23 @@ struct MESHFORGE_API FMeshPipelineIO
 	 */
 	UPROPERTY(BlueprintReadOnly, Category = "IO")
 	bool bProducesTextures = false;
+
+	/**
+	 * This pipeline moves vertices, so the vendor's copy of the mesh stops being ours.
+	 *
+	 * **What stops a retexture silently throwing away a wrap.** A vendor retextures the mesh *it*
+	 * holds, and hands back its own geometry. That is free and correct while our mesh and its copy
+	 * are the same thing - and a disaster the moment they are not: point a fit-and-wrapped garment
+	 * at its originating task id and what comes back is the *unwrapped* mesh, beautifully textured,
+	 * with the wrap gone. A failure that looks like success.
+	 *
+	 * So a step that changes geometry says so here, the chain remembers it, and every later step
+	 * uploads instead of pointing. Declared by the step rather than read from a record: this is a
+	 * statement about code that just ran, not a claim about an asset's history, which is what keeps
+	 * it clear of the provenance contract's rule that provenance is never read to decide anything.
+	 */
+	UPROPERTY(BlueprintReadOnly, Category = "IO")
+	bool bChangesGeometry = false;
 };
 
 /**
@@ -104,6 +141,45 @@ public:
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Pipeline")
 	bool bEnabled = true;
+
+	/**
+	 * What to make, in words, for a pipeline that works from words: the picture an image pipeline draws,
+	 * or the object a mesh generator builds when it reads text.
+	 *
+	 * **Each pipeline keeps its own.** A picture and the mesh made from it often want different words, and
+	 * a retexture keeps a description of its own on its step - one prompt for the whole definition was
+	 * the wrong shape. Shown only where ReadsPrompt() says it is read. Switching a stage to another
+	 * pipeline carries the prompt across; a workflow never stores one, because a prompt is what is being
+	 * made rather than how.
+	 *
+	 * Not part of Signature() - owned by this base class, so the settings loop skips it. The definition's
+	 * stage hash adds it instead, only where it differs from the definition's old shared prompt, so moving
+	 * the prompts onto the pipelines marked nothing stale.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Prompt", meta = (MultiLine = true))
+	FString Prompt;
+
+	/**
+	 * Whether this pipeline would read Prompt. An image pipeline that draws from words does; one that works
+	 * only from pictures does not. A mesh generator does when its provider reads text - alone, beside a
+	 * picture, or to draw one first. A post step does not: one that wants words, like a retexture, has its
+	 * own setting for them.
+	 */
+	virtual bool ReadsPrompt() const;
+
+	/**
+	 * What a mesh pipeline builds from. Either, unless the subclass offers a choice; see EMeshPipelineInput.
+	 *
+	 * Read by ReadsPrompt(), by the panel to decide whether to draw the prompt or the pictures, and by the
+	 * submission to decide what to send - so the three cannot disagree about which request runs.
+	 */
+	virtual EMeshPipelineInput GetInputMode() const { return EMeshPipelineInput::Either; }
+
+	/** Whether this pipeline would send the definition's pictures: a mesh pipeline not set to words only. */
+	bool ReadsImages() const
+	{
+		return GetKind() == EMeshPipelineKind::Mesh && GetInputMode() != EMeshPipelineInput::Text;
+	}
 
 	// --- what the subclass declares ---------------------------------------------------------------
 

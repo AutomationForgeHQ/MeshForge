@@ -33,3 +33,20 @@ public:
 	/** Opens the four-tab toolkit rather than a details panel. See FMeshDefEditorToolkit. */
 	virtual EAssetCommandResult OpenAssets(const FAssetOpenArgs& OpenArgs) const override;
 };
+
+/**
+ * A Mesh Workflow in the Content Browser: the MeshForge category and colour, a slightly lighter orange so
+ * workflows and definitions can be told apart in one folder. Double-click opens its settings.
+ */
+UCLASS()
+class UMeshWorkflowAssetDefinition : public UAssetDefinitionDefault
+{
+	GENERATED_BODY()
+
+public:
+
+	virtual FText GetAssetDisplayName() const override;
+	virtual FLinearColor GetAssetColor() const override;
+	virtual TSoftClassPtr<UObject> GetAssetClass() const override;
+	virtual TConstArrayView<FAssetCategoryPath> GetAssetCategories() const override;
+};

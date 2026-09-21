@@ -2,6 +2,8 @@
 
 #include "MeshForgePipeline.h"
 
+#include "IMeshProvider.h"
+#include "MeshForge.h"
 #include "UObject/UnrealType.h"
 #include "UObject/EnumProperty.h"
 
@@ -92,6 +94,43 @@ FString UMeshForgePipeline::Validate() const
 	return FString();
 }
 
+bool UMeshForgePipeline::ReadsPrompt() const
+{
+	switch (GetKind())
+	{
+	case EMeshPipelineKind::Image:
+	case EMeshPipelineKind::Refine:
+		return GetIO().bNeedsPrompt;
+
+	case EMeshPipelineKind::Mesh:
+	{
+		// A pipeline that chose its input has already answered.
+		switch (GetInputMode())
+		{
+		case EMeshPipelineInput::Text:  return true;
+		case EMeshPipelineInput::Image: return false;
+		default: break;
+		}
+
+		// Asked of the provider the pipeline sends to, because only it knows whether words reach the
+		// model. One that is not installed is given the benefit of the doubt: an unused prompt box is a
+		// smaller wrong than a hidden one somebody needed.
+		const FMeshForgeModule* Module = FMeshForgeModule::GetPtrIfLoaded();
+		const TSharedPtr<IMeshProvider> Provider = Module ? Module->FindProvider(GetProviderId()) : nullptr;
+		if (!Provider.IsValid())
+		{
+			return true;
+		}
+		const FMeshProviderCaps Caps = Provider->GetCaps();
+		return Caps.bSupportsTextPrompt || Caps.bSupportsTextWithImage
+			|| (Caps.bRequiresImage && Provider->SupportsConceptImages());
+	}
+
+	default:
+		return false;
+	}
+}
+
 FString UMeshForgePipeline::Signature() const
 {
 	// Class name first, because two pipelines with identical settings are still different pipelines
@@ -100,10 +139,23 @@ FString UMeshForgePipeline::Signature() const
 
 	// Reflected rather than hand-written, so a subclass cannot gain a setting and forget to include
 	// it here - which would leave every definition using it claiming an output it no longer makes.
+	const UObject* Defaults = GetClass()->GetDefaultObject();
+
 	for (TFieldIterator<FProperty> It(GetClass()); It; ++It)
 	{
 		const FProperty* Property = *It;
 		if (!MeshForgePipelinePrivate::IsSettingProperty(Property))
+		{
+			continue;
+		}
+
+		// **A setting added to an existing class must not change the signature of every saved instance.**
+		// Signatures feed the stage hashes stored in definitions, so a new property that always prints
+		// marks every definition using the class stale the moment the code ships, though nothing about
+		// them changed. A property marked SignatureOmitsDefault is left out while it holds its default,
+		// which is exactly the value every older asset loads with.
+		if (Property->HasMetaData(TEXT("SignatureOmitsDefault"))
+			&& Property->Identical_InContainer(this, Defaults))
 		{
 			continue;
 		}

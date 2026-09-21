@@ -4,7 +4,10 @@
 
 #include "CoreMinimal.h"
 #include "MeshForgeTypes.h"
+#include "UObject/ObjectKey.h"
 #include "Widgets/SCompoundWidget.h"
+
+enum class EMeshSectionState : uint8;
 
 class UMeshDef;
 class UMeshForgePipeline;
@@ -52,7 +55,61 @@ public:
 	void Refresh();
 
 private:
-	TSharedRef<SWidget> BuildStageRow(EMeshStage Stage);
+	/**
+	 * The bar above the stages: which of the five this definition uses.
+	 *
+	 * A switched-off stage's row is not drawn at all - the switches are where it can be seen and turned
+	 * back on. The workflow picker joins this bar once workflows exist.
+	 */
+	TSharedRef<SWidget> BuildWorkflowBar();
+
+	/** Switch one stage on or off, as one undoable edit, and redraw. */
+	void SetStageSwitch(EMeshStage Stage, bool bOn);
+
+	/**
+	 * Apply a workflow to this definition, as one undoable edit.
+	 *
+	 * Asks first when the definition already has pipelines of its own, because applying replaces them;
+	 * reapplying the workflow it already came from does not ask. Slots that could not be filled - a preset
+	 * from a plugin that is not installed - are reported after.
+	 */
+	void ApplyWorkflow(const FSoftObjectPath& WorkflowPath, bool bReapply);
+
+	/** Save the definition as it stands as a new workflow asset, chosen with a save dialog. */
+	void SaveAsWorkflow();
+
+	/** "Matches its workflow" or "3 changes since applied", with the list; recomputed at most once a second. */
+	FText WorkflowChangesText() const;
+	FText WorkflowChangesTooltip() const;
+	void RefreshWorkflowChanges() const;
+
+	mutable double WorkflowChangesAt = -1.0;
+	mutable TArray<FString> WorkflowChanges;
+
+	/**
+	 * What the definition starts from, drawn when Mesh is switched off.
+	 *
+	 * The Source Mesh picker lives on the Mesh row, and that row is hidden then - while the Source Mesh
+	 * has become the definition's whole input. So it moves to the top, where an empty one is the first
+	 * thing read.
+	 */
+	TSharedRef<SWidget> BuildStartsFrom();
+
+	/** The Source Mesh picker, shared by the Mesh row and Starts From. */
+	TSharedRef<SWidget> BuildSourceMeshPicker();
+
+	/** One stage as a section: a numbered badge (its position among the stages switched on) and a header that opens and closes it. */
+	TSharedRef<SWidget> BuildStageRow(EMeshStage Stage, int32 Number);
+
+	/**
+	 * A stage's badge. Ran is done; running is current; stale or failed needs attention; of the stages not
+	 * run yet, the first that can run is current and the rest wait.
+	 */
+	EMeshSectionState StageSectionState(EMeshStage Stage) const;
+
+	/** Whether each section is open, kept across rebuilds; a section not in here opens unless it has run. */
+	TMap<EMeshStage, bool> StageExpanded;
+	TMap<FObjectKey, bool> StepExpanded;
 
 	/**
 	 * The bar at the foot of a stage: what running it would do or why it cannot, what it costs, and
@@ -93,8 +150,14 @@ private:
 	 */
 	void AddPostStep(UClass* Class);
 
+	/** Append a step another plugin registered, by its id. */
+	void AddRegisteredPostStep(FName TypeId);
+
 	/** Remove the step at this position. */
 	void RemovePostStep(int32 Index);
+
+	/** Move the step at From to To, as one undoable edit. A move the chain would refuse to run is not offered. */
+	void MovePostStep(int32 From, int32 To);
 
 	/** The Post stage's own controls: what is in the chain, and how to add to it. */
 	TSharedRef<SWidget> BuildPostChain();
@@ -159,16 +222,12 @@ private:
 	FReply OnRunClicked(EMeshStage Stage);
 
 	/**
-	 * The prompt, given its own editor at the top rather than a one-line box in a property grid.
-	 *
-	 * It is the field with the most effect on the result and the one people rewrite most often, and
-	 * a details panel gave it the same single line it gave a lightmap resolution. Committed on
-	 * focus loss rather than per keystroke, so a rewrite is one undo rather than forty.
+	 * The definition's own prompt, edited on the Mesh stage only for a definition made before mesh
+	 * pipelines existed - its generator has no pipeline to hold the words. Every other prompt belongs to
+	 * a pipeline and is drawn in its settings. Committed on focus loss, so a rewrite is one undo.
 	 */
 	FText GetPrompt() const;
 	void OnPromptCommitted(const FText& NewText, ETextCommit::Type CommitType);
-
-	TSharedPtr<class SMultiLineEditableTextBox> PromptBox;
 
 	/**
 	 * One details view per single-pipeline stage, kept between refreshes.

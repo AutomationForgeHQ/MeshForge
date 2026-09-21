@@ -49,6 +49,18 @@ public:
 	UFUNCTION()
 	static TArray<FString> GetProviderOptions();
 
+	/**
+	 * The workflow offered first when a Mesh Definition is created in the Content Browser.
+	 *
+	 * Preselected in the "start from a workflow" choice, never applied without it: a definition an agent
+	 * creates starts from the workflow it names, or blank, so what it gets does not depend on this setting.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Providers", meta = (AllowedClasses = "/Script/MeshForge.MeshWorkflow"))
+	FSoftObjectPath DefaultWorkflow;
+
+	/** Where Save as Workflow offers to put a new workflow. */
+	FString GetWorkflowsPath() const { return OutputContentPath / TEXT("Workflows"); }
+
 	// ---------------------------------------------------------------------------------------------
 	// Output
 	// ---------------------------------------------------------------------------------------------

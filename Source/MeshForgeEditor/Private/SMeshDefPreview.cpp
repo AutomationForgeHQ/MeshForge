@@ -3,13 +3,20 @@
 #include "MeshDef.h"
 #include "ForgeLibrary.h"
 #include "MeshForgeSettings.h"
+#include "MeshForgeEditorSettings.h"
 #include "SMeshCompareWipe.h"
 
 #include "AssetRegistry/ARFilter.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
+#include "Components/SkeletalMeshComponent.h"
 #include "Components/StaticMeshComponent.h"
+#include "Engine/SkeletalMesh.h"
 #include "Engine/StaticMesh.h"
+#include "Rendering/SkeletalMeshLODModel.h"
+#include "Rendering/SkeletalMeshLODRenderData.h"
+#include "Rendering/SkeletalMeshModel.h"
+#include "Rendering/SkeletalMeshRenderData.h"
 #include "Editor.h"
 #include "Subsystems/AssetEditorSubsystem.h"
 #include "MeshDescription.h"
@@ -120,54 +127,105 @@ namespace MeshDefPreviewPrivate
 		FVector Skew = FVector::ZeroVector;
 	};
 
-	static FSubject Measure(UStaticMesh* Mesh)
+	/** The subject's box, whichever kind of mesh it is. Zero extent when it is neither. */
+	static bool BoundsOf(const UObject* Mesh, FBoxSphereBounds& OutBounds)
+	{
+		if (const UStaticMesh* Static = Cast<UStaticMesh>(Mesh))
+		{
+			OutBounds = Static->GetBounds();
+			return true;
+		}
+
+		if (const USkeletalMesh* Skeletal = Cast<USkeletalMesh>(Mesh))
+		{
+			OutBounds = Skeletal->GetBounds();
+			return true;
+		}
+
+		return false;
+	}
+
+	/**
+	 * Where the vertices sit, strided, for the skew.
+	 *
+	 * A static mesh is read from its mesh description and a skeletal one from the model the editor
+	 * keeps - the authored data in both cases rather than the render data, for the same reason the
+	 * counts are: under Nanite the render data is a fallback mesh an order of magnitude smaller
+	 * than the asset, and this plugin has already reported that number wrongly once.
+	 */
+	static void SampleVertices(const UObject* Mesh, TFunctionRef<void(const FVector&)> Visit)
+	{
+		if (const UStaticMesh* Static = Cast<UStaticMesh>(Mesh))
+		{
+			const FMeshDescription* Description = Static->GetMeshDescription(0);
+
+			if (Description == nullptr)
+			{
+				return;
+			}
+
+			const auto Positions = Description->GetVertexPositions();
+			const int32 Count = Description->Vertices().Num();
+			const int32 Stride = FMath::Max(1, Count / SkewSamples);
+
+			for (int32 Index = 0; Index < Count; Index += Stride)
+			{
+				const FVertexID Vertex(Index);
+
+				if (Description->IsVertexValid(Vertex))
+				{
+					Visit(FVector(Positions[Vertex]));
+				}
+			}
+
+			return;
+		}
+
+		const USkeletalMesh* Skeletal = Cast<USkeletalMesh>(Mesh);
+		const FSkeletalMeshModel* Model = Skeletal ? Skeletal->GetImportedModel() : nullptr;
+
+		if (Model == nullptr || Model->LODModels.Num() == 0)
+		{
+			return;
+		}
+
+		const FSkeletalMeshLODModel& Lod = Model->LODModels[0];
+		const int32 Stride = FMath::Max(1, static_cast<int32>(Lod.NumVertices) / SkewSamples);
+
+		for (const FSkelMeshSection& Section : Lod.Sections)
+		{
+			for (int32 Index = 0; Index < Section.SoftVertices.Num(); Index += Stride)
+			{
+				Visit(FVector(Section.SoftVertices[Index].Position));
+			}
+		}
+	}
+
+	static FSubject Measure(UObject* Mesh)
 	{
 		FSubject Subject;
 
-		if (Mesh == nullptr)
+		FBoxSphereBounds Bounds;
+
+		if (Mesh == nullptr || !BoundsOf(Mesh, Bounds))
 		{
 			return Subject;
 		}
-
-		const FBoxSphereBounds Bounds = Mesh->GetBounds();
 
 		Subject.Centre = Bounds.Origin;
 		Subject.Extent = Bounds.BoxExtent.ComponentMax(FVector(KINDA_SMALL_NUMBER));
 		Subject.Radius = FMath::Max(static_cast<float>(Bounds.SphereRadius), KINDA_SMALL_NUMBER);
 
-		const FMeshDescription* Description = Mesh->GetMeshDescription(0);
-
-		if (Description == nullptr)
-		{
-			return Subject;
-		}
-
-		const auto Positions = Description->GetVertexPositions();
-
-		const int32 Count = Description->Vertices().Num();
-
-		if (Count <= 0)
-		{
-			return Subject;
-		}
-
 		// Strided rather than every vertex: the centroid of a fifth of a million points is the same
 		// answer as the centroid of a million, and this runs whenever a take is chosen.
-		const int32 Stride = FMath::Max(1, Count / SkewSamples);
-
 		FVector Sum = FVector::ZeroVector;
 		int32 Taken = 0;
 
-		for (int32 Index = 0; Index < Count; Index += Stride)
+		SampleVertices(Mesh, [&Sum, &Taken](const FVector& Position)
 		{
-			const FVertexID Vertex(Index);
-
-			if (Description->IsVertexValid(Vertex))
-			{
-				Sum += FVector(Positions[Vertex]);
-				++Taken;
-			}
-		}
+			Sum += Position;
+			++Taken;
+		});
 
 		if (Taken > 0)
 		{
@@ -282,9 +340,9 @@ void FMeshDefPreviewClient::ShareOrbit(const TSharedRef<FMeshOrbitState>& InOrbi
 	AppliedSerial = MAX_uint32;
 }
 
-void FMeshDefPreviewClient::FrameMesh(UStaticMeshComponent* InComponent)
+void FMeshDefPreviewClient::FrameMesh(UPrimitiveComponent* InComponent)
 {
-	if (InComponent == nullptr || InComponent->GetStaticMesh() == nullptr)
+	if (InComponent == nullptr)
 	{
 		return;
 	}
@@ -443,7 +501,49 @@ void SMeshDefPreviewViewport::Construct(const FArguments& InArgs)
 	Component->bSelectable = false;
 	PreviewScene->AddComponent(Component, FTransform::Identity);
 
+	// Registered beside it and empty until a skinned take is chosen. See the declaration for why
+	// both exist from the start rather than being swapped in.
+	SkeletalComponent = NewObject<USkeletalMeshComponent>();
+	SkeletalComponent->bSelectable = false;
+
+	// The reference pose, and nothing animating it. What a garment was wrapped around is the
+	// character in its reference pose, so anything else would be showing the shirt against a body
+	// it was never fitted to.
+	SkeletalComponent->SetAnimationMode(EAnimationMode::AnimationSingleNode);
+	SkeletalComponent->SetUpdateAnimationInEditor(false);
+	PreviewScene->AddComponent(SkeletalComponent, FTransform::Identity);
+
+	SetFloorVisible(UMeshForgeEditorSettings::Get()->bShowPreviewFloor);
+
 	SEditorViewport::Construct(SEditorViewport::FArguments());
+}
+
+void SMeshDefPreviewViewport::Tick(const FGeometry& AllottedGeometry, const double InCurrentTime, const float InDeltaTime)
+{
+	SEditorViewport::Tick(AllottedGeometry, InCurrentTime, InDeltaTime);
+
+	if (!bFloorVisible && PreviewScene.IsValid() && PreviewScene->GetFloorVisibility())
+	{
+		SetFloorVisible(false);
+	}
+}
+
+void SMeshDefPreviewViewport::SetFloorVisible(bool bVisible)
+{
+	bFloorVisible = bVisible;
+	if (PreviewScene.IsValid())
+	{
+		// Direct: otherwise the scene writes the choice into the shared asset viewer profile, and the floor
+		// disappears from every Static Mesh editor too.
+		PreviewScene->SetFloorVisibility(bVisible, /*bDirect*/ true);
+	}
+
+	// This viewport draws on demand, so a change nobody asks it to redraw stays off screen: the floor was
+	// already hidden while the last picture, drawn with it, stayed up until the mouse next moved over it.
+	if (Client.IsValid())
+	{
+		Client->Invalidate();
+	}
 }
 
 SMeshDefPreviewViewport::~SMeshDefPreviewViewport()
@@ -460,80 +560,288 @@ TSharedRef<FEditorViewportClient> SMeshDefPreviewViewport::MakeEditorViewportCli
 	return Client.ToSharedRef();
 }
 
-void SMeshDefPreviewViewport::SetMesh(UStaticMesh* Mesh, bool bFrame)
+void SMeshDefPreviewViewport::SetMesh(UObject* Mesh, bool bFrame)
 {
-	if (!Component)
+	if (!Component || !SkeletalComponent)
 	{
 		return;
 	}
 
-	if (Component->GetStaticMesh() == Mesh)
+	UStaticMesh* Static     = Cast<UStaticMesh>(Mesh);
+	USkeletalMesh* Skeletal = Cast<USkeletalMesh>(Mesh);
+
+	// Anything that is neither clears both, rather than leaving whichever was set last on screen
+	// under a label that now names something else.
+	const bool bSame = (Component->GetStaticMesh() == Static)
+		&& (SkeletalComponent->GetSkeletalMeshAsset() == Skeletal);
+
+	if (bSame)
 	{
 		return;
 	}
 
-	Component->SetStaticMesh(Mesh);
+	Component->SetStaticMesh(Static);
 	Component->MarkRenderStateDirty();
+
+	SkeletalComponent->SetSkeletalMeshAsset(Skeletal);
+	SkeletalComponent->MarkRenderStateDirty();
+
+	// Placed again, because the component now drawing may never have been given the transform the
+	// other one was placed with.
+	SetSubjectTransform(SubjectTransform);
 
 	if (bFrame && Client.IsValid())
 	{
-		Client->FrameMesh(Component);
+		Client->FrameBounds(GetVisibleBounds());
 	}
 }
 
 void SMeshDefPreviewViewport::SetSubjectTransform(const FTransform& Transform)
 {
-	if (Component == nullptr)
+	SubjectTransform = Transform;
+
+	const auto Place = [&Transform](USceneComponent* Target)
+	{
+		if (Target == nullptr)
+		{
+			return;
+		}
+
+		Target->SetWorldTransform(Transform);
+		Target->UpdateBounds();
+		Target->MarkRenderStateDirty();
+	};
+
+	Place(Component);
+	Place(SkeletalComponent);
+
+	// Companions are deliberately not placed with it. They stand at their own origin at their own
+	// size, and their being here is what stops the subject being moved at all - see SetCompanions.
+}
+
+UObject* SMeshDefPreviewViewport::GetMesh() const
+{
+	if (Component && Component->GetStaticMesh() != nullptr)
+	{
+		return Component->GetStaticMesh();
+	}
+
+	if (SkeletalComponent && SkeletalComponent->GetSkeletalMeshAsset() != nullptr)
+	{
+		return SkeletalComponent->GetSkeletalMeshAsset();
+	}
+
+	return nullptr;
+}
+
+UMeshComponent* SMeshDefPreviewViewport::ActiveComponent() const
+{
+	if (Component && Component->GetStaticMesh() != nullptr)
+	{
+		return Component;
+	}
+
+	if (SkeletalComponent && SkeletalComponent->GetSkeletalMeshAsset() != nullptr)
+	{
+		return SkeletalComponent;
+	}
+
+	return nullptr;
+}
+
+UMeshComponent* SMeshDefPreviewViewport::GetMeshComponent() const
+{
+	return ActiveComponent();
+}
+
+void SMeshDefPreviewViewport::SetCompanions(FName ExtensionId, const TArray<USceneComponent*>& Components)
+{
+	if (!PreviewScene.IsValid())
 	{
 		return;
 	}
 
-	Component->SetWorldTransform(Transform);
-	Component->UpdateBounds();
-	Component->MarkRenderStateDirty();
+	if (TArray<TObjectPtr<USceneComponent>>* Existing = Companions.Find(ExtensionId))
+	{
+		for (const TObjectPtr<USceneComponent>& Old : *Existing)
+		{
+			if (Old != nullptr)
+			{
+				PreviewScene->RemoveComponent(Old);
+			}
+		}
+	}
+
+	Companions.Remove(ExtensionId);
+
+	if (Components.Num() > 0)
+	{
+		TArray<TObjectPtr<USceneComponent>>& Added = Companions.Add(ExtensionId);
+
+		for (USceneComponent* New : Components)
+		{
+			if (New == nullptr)
+			{
+				continue;
+			}
+
+			// Only a primitive has the flag, and only a primitive would be clickable anyway.
+			if (UPrimitiveComponent* Primitive = Cast<UPrimitiveComponent>(New))
+			{
+				Primitive->bSelectable = false;
+			}
+
+			// At identity, never at SubjectTransform: a companion is the fixed thing in the picture.
+			PreviewScene->AddComponent(New, FTransform::Identity);
+			Added.Add(New);
+		}
+	}
+
+	if (Client.IsValid())
+	{
+		Client->Invalidate();
+	}
 }
 
-UStaticMesh* SMeshDefPreviewViewport::GetMesh() const
+void SMeshDefPreviewViewport::ClearCompanions()
 {
-	return Component ? Component->GetStaticMesh() : nullptr;
+	TArray<FName> Ids;
+	Companions.GetKeys(Ids);
+
+	for (const FName Id : Ids)
+	{
+		SetCompanions(Id, TArray<USceneComponent*>());
+	}
 }
 
-FText SMeshDefPreviewViewport::DescribeMesh() const
+FBoxSphereBounds SMeshDefPreviewViewport::GetVisibleBounds() const
 {
-	UStaticMesh* Mesh = GetMesh();
+	TOptional<FBoxSphereBounds> Total;
+
+	const auto Include = [&Total](const USceneComponent* Part)
+	{
+		const UPrimitiveComponent* Primitive = Cast<UPrimitiveComponent>(Part);
+
+		if (Primitive == nullptr || Primitive->Bounds.SphereRadius <= KINDA_SMALL_NUMBER)
+		{
+			return;
+		}
+
+		Total = Total.IsSet() ? (Total.GetValue() + Primitive->Bounds) : Primitive->Bounds;
+	};
+
+	Include(ActiveComponent());
+
+	for (const TPair<FName, TArray<TObjectPtr<USceneComponent>>>& Set : Companions)
+	{
+		for (const TObjectPtr<USceneComponent>& Companion : Set.Value)
+		{
+			Include(Companion);
+		}
+	}
+
+	return Total.IsSet()
+		? Total.GetValue()
+		: FBoxSphereBounds(FVector::ZeroVector, FVector::ZeroVector, 0.0f);
+}
+
+FText SMeshDefPreviewViewport::DescribeMesh(bool bWithPivot) const
+{
+	UObject* Mesh = GetMesh();
 	if (Mesh == nullptr)
 	{
 		return FText::GetEmpty();
 	}
 
-	// Counted from the mesh description rather than LOD 0's render data. Under Nanite the render
-	// data reports the *fallback* mesh, which is smaller by an order of magnitude and is not what
-	// the asset contains - a number that has already been reported wrongly once in this plugin.
+	// Counted from the authored data rather than LOD 0's render data. Under Nanite the render data
+	// reports the *fallback* mesh, which is smaller by an order of magnitude and is not what the
+	// asset contains - a number that has already been reported wrongly once in this plugin.
 	int32 Triangles = 0;
 	int32 Vertices  = 0;
-	if (const FMeshDescription* Description = Mesh->GetMeshDescription(0))
+	int32 Materials = 0;
+	FText Suffix    = FText::GetEmpty();
+
+	FBoxSphereBounds Bounds(FVector::ZeroVector, FVector::ZeroVector, 0.0f);
+
+	if (UStaticMesh* Static = Cast<UStaticMesh>(Mesh))
 	{
-		Triangles = Description->Triangles().Num();
-		Vertices  = Description->Vertices().Num();
+		if (const FMeshDescription* Description = Static->GetMeshDescription(0))
+		{
+			Triangles = Description->Triangles().Num();
+			Vertices  = Description->Vertices().Num();
+		}
+
+		Materials = Static->GetStaticMaterials().Num();
+		Bounds    = Static->GetBounds();
+
+		if (Static->IsNaniteEnabled())
+		{
+			Suffix = LOCTEXT("NaniteSuffix", "  ·  Nanite");
+		}
+	}
+	else if (USkeletalMesh* Skeletal = Cast<USkeletalMesh>(Mesh))
+	{
+		if (const FSkeletalMeshModel* Model = Skeletal->GetImportedModel())
+		{
+			if (Model->LODModels.Num() > 0)
+			{
+				const FSkeletalMeshLODModel& Lod = Model->LODModels[0];
+
+				Vertices = static_cast<int32>(Lod.NumVertices);
+
+				for (const FSkelMeshSection& Section : Lod.Sections)
+				{
+					Triangles += Section.NumTriangles;
+				}
+			}
+		}
+
+		Materials = Skeletal->GetMaterials().Num();
+		Bounds    = Skeletal->GetBounds();
+
+		// The number that says this is a skinned take at all, and the one somebody checks after a
+		// bone profile has folded weights away.
+		Suffix = FText::Format(LOCTEXT("BonesSuffix", "  ·  {0} bones"),
+			FText::AsNumber(Skeletal->GetRefSkeleton().GetNum()));
 	}
 
-	const FBoxSphereBounds Bounds = Mesh->GetBounds();
 	const FVector Size = Bounds.BoxExtent * 2.0;
+
+	// Where the mesh sits, not only how big it is. In true space that is the number that answers
+	// "why is it over there" - a garment reported as the right size while it hangs a foot off the
+	// body is a strip that has said nothing useful.
+	if (bWithPivot)
+	{
+		Suffix = FText::Format(LOCTEXT("PivotSuffix", "{0}  ·  centre {1}, {2}, {3} cm"),
+			Suffix,
+			FText::AsNumber(FMath::RoundToInt(Bounds.Origin.X)),
+			FText::AsNumber(FMath::RoundToInt(Bounds.Origin.Y)),
+			FText::AsNumber(FMath::RoundToInt(Bounds.Origin.Z)));
+	}
 
 	return FText::Format(
 		LOCTEXT("MeshStats", "{0} triangles  ·  {1} vertices  ·  {2} materials  ·  {3} × {4} × {5} cm{6}"),
 		FText::AsNumber(Triangles),
 		FText::AsNumber(Vertices),
-		FText::AsNumber(Mesh->GetStaticMaterials().Num()),
+		FText::AsNumber(Materials),
 		FText::AsNumber(FMath::RoundToInt(Size.X)),
 		FText::AsNumber(FMath::RoundToInt(Size.Y)),
 		FText::AsNumber(FMath::RoundToInt(Size.Z)),
-		Mesh->IsNaniteEnabled() ? LOCTEXT("NaniteSuffix", "  ·  Nanite") : FText::GetEmpty());
+		Suffix);
 }
 
 void SMeshDefPreviewViewport::AddReferencedObjects(FReferenceCollector& Collector)
 {
 	Collector.AddReferencedObject(Component);
+	Collector.AddReferencedObject(SkeletalComponent);
+
+	for (TPair<FName, TArray<TObjectPtr<USceneComponent>>>& Set : Companions)
+	{
+		for (TObjectPtr<USceneComponent>& Companion : Set.Value)
+		{
+			Collector.AddReferencedObject(Companion);
+		}
+	}
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -543,6 +851,16 @@ void SMeshDefPreviewViewport::AddReferencedObjects(FReferenceCollector& Collecto
 void SMeshDefPreview::Construct(const FArguments& InArgs)
 {
 	Definition = InArgs._Definition;
+
+	// Made before the bar, so their controls exist by the time there is a slot to put them in.
+	// Each is handed this widget as its host and keeps it for life; nothing here ever reads what
+	// an extension built, which is what lets an add-on own its control outright.
+	for (const FMeshDefPreviewExtensionType& Type : FMeshDefPreviewExtensions::Get())
+	{
+		Extensions.Add(Type.Make(SharedThis(this)));
+	}
+
+	TSharedPtr<SHorizontalBox> ExtensionBar;
 
 	ChildSlot
 	[
@@ -583,13 +901,13 @@ void SMeshDefPreview::Construct(const FArguments& InArgs)
 				[
 					SNew(SCheckBox)
 					.Visibility(this, &SMeshDefPreview::CompareOnlyVisibility)
-					.ToolTipText(LOCTEXT("AlignTip",
-						"Fit B onto A: same centre, same size, and turned by whichever quarter turn best "
-						"matches its shape to A's.\n\n"
-						"Two generators disagree about which way is up, not by nineteen degrees, so a "
-						"quarter turn is usually the whole difference. A is never moved, the strip below "
-						"says what B was fitted by, and both meshes true dimensions are reported whatever "
-						"this is set to."))
+					.ToolTipText(this, &SMeshDefPreview::AlignTooltip)
+
+					// Off the table while something is standing beside the subject. Align exists to
+					// throw away size and position; those are the two things a character is here to
+					// check. A greyed box that says why beats one that quietly answers the wrong
+					// question.
+					.IsEnabled_Lambda([this]() { return !IsTrueSpace(); })
 					.IsChecked_Lambda([this]()
 					{
 						return bAlign ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
@@ -671,7 +989,38 @@ void SMeshDefPreview::Construct(const FArguments& InArgs)
 					.OnClicked_Lambda([this]() { Swap(); return FReply::Handled(); })
 				]
 
+				// Whatever the installed add-ons put here. Beside the take picker rather than over
+				// with the floor and the view mode, because these choose what is on screen and
+				// those two choose how it is drawn.
+				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+				[
+					SAssignNew(ExtensionBar, SHorizontalBox)
+				]
+
 				+ SHorizontalBox::Slot().FillWidth(1.0f)
+
+				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+					.Padding(0.0f, 0.0f, 10.0f, 0.0f)
+				[
+					SNew(SCheckBox)
+					.ToolTipText(LOCTEXT("FloorTip",
+						"Show the floor. Off by default: most generated meshes keep their pivot at their "
+						"centre, so the floor cuts through the middle of them. Remembered for next time."))
+					.IsChecked_Lambda([]()
+					{
+						return UMeshForgeEditorSettings::Get()->bShowPreviewFloor ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
+					})
+					.OnCheckStateChanged_Lambda([this](ECheckBoxState State)
+					{
+						UMeshForgeEditorSettings* Settings = UMeshForgeEditorSettings::Get();
+						Settings->bShowPreviewFloor = (State == ECheckBoxState::Checked);
+						Settings->SaveConfig();
+						ApplyFloor();
+					})
+					[
+						SNew(STextBlock).Text(LOCTEXT("FloorLabel", "Floor"))
+					]
+				]
 
 				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
 				[
@@ -780,6 +1129,23 @@ void SMeshDefPreview::Construct(const FArguments& InArgs)
 		}
 	}
 
+	if (ExtensionBar.IsValid())
+	{
+		for (const TSharedRef<IMeshDefPreviewExtension>& Extension : Extensions)
+		{
+			if (const TSharedPtr<SWidget> Control = Extension->MakeControl())
+			{
+				ExtensionBar->AddSlot()
+					.AutoWidth()
+					.VAlign(VAlign_Center)
+					.Padding(12.0f, 0.0f, 0.0f, 0.0f)
+					[
+						Control.ToSharedRef()
+					];
+			}
+		}
+	}
+
 	Refresh();
 }
 
@@ -821,6 +1187,10 @@ void SMeshDefPreview::GatherChoices()
 
 		FARFilter Filter;
 		Filter.ClassPaths.Add(UStaticMesh::StaticClass()->GetClassPathName());
+
+		// The skinned takes too. A garment stops being a static mesh at its skinning step, and a
+		// list that ended there could show every take of a shirt except the finished one.
+		Filter.ClassPaths.Add(USkeletalMesh::StaticClass()->GetClassPathName());
 		Filter.PackagePaths.Add(FName(*Root));
 		Filter.bRecursivePaths = true;
 
@@ -830,7 +1200,7 @@ void SMeshDefPreview::GatherChoices()
 		for (const FAssetData& Asset : Found)
 		{
 			FMeshChoice Choice;
-			Choice.Mesh = TSoftObjectPtr<UStaticMesh>(Asset.GetSoftObjectPath());
+			Choice.Mesh = TSoftObjectPtr<UObject>(Asset.GetSoftObjectPath());
 
 			// <root>/Mesh/<take id>/... or <root>/Post/<take id>/...
 			FString Relative = Asset.PackagePath.ToString();
@@ -902,7 +1272,7 @@ void SMeshDefPreview::GatherChoices()
 	if (!Def->SourceMesh.IsNull())
 	{
 		FMeshChoice Supplied;
-		Supplied.Mesh   = Def->SourceMesh;
+		Supplied.Mesh   = TSoftObjectPtr<UObject>(Def->SourceMesh.ToSoftObjectPath());
 		Supplied.Label  = LOCTEXT("SuppliedChoice", "supplied mesh");
 		Supplied.Detail = FText::FromString(Def->SourceMesh.ToString());
 
@@ -910,18 +1280,27 @@ void SMeshDefPreview::GatherChoices()
 	}
 
 	// And whatever was imported last, if it somehow lives outside the generated folder - an older
-	// definition, or one somebody pointed elsewhere.
-	if (!Def->ImportedMesh.IsNull()
-		&& !Choices.ContainsByPredicate([Def](const FMeshChoice& Choice)
-			{ return Choice.Mesh == Def->ImportedMesh; }))
+	// definition, or one somebody pointed elsewhere. Both results: a garment chain leaves a wrapped
+	// static mesh and a skinned one, and they are two different things to look at.
+	const auto AddImported = [this](const FSoftObjectPath& Path, const FText& Label)
 	{
+		if (Path.IsNull()
+			|| Choices.ContainsByPredicate([&Path](const FMeshChoice& Choice)
+				{ return Choice.Mesh.ToSoftObjectPath() == Path; }))
+		{
+			return;
+		}
+
 		FMeshChoice Current;
-		Current.Mesh   = Def->ImportedMesh;
-		Current.Label  = LOCTEXT("CurrentChoice", "current import");
-		Current.Detail = FText::FromString(Def->ImportedMesh.ToString());
+		Current.Mesh   = TSoftObjectPtr<UObject>(Path);
+		Current.Label  = Label;
+		Current.Detail = FText::FromString(Path.ToString());
 
 		Choices.Insert(MoveTemp(Current), 0);
-	}
+	};
+
+	AddImported(Def->ImportedMesh.ToSoftObjectPath(), LOCTEXT("CurrentChoice", "current import"));
+	AddImported(Def->ImportedSkeletalMesh.ToSoftObjectPath(), LOCTEXT("CurrentSkinnedChoice", "current import - skinned"));
 
 	// A choice that has been deleted from the project since it was made is not a choice any more.
 	if (!ChosenA.IsNull()
@@ -942,7 +1321,7 @@ TSharedRef<SWidget> SMeshDefPreview::BuildChoiceMenu(bool bSideB)
 	FMenuBuilder Menu(/*bShouldCloseWindowAfterMenuSelection*/ true, nullptr);
 
 	const UMeshDef* Def = Definition.Get();
-	const TSoftObjectPtr<UStaticMesh> Current = Chosen(bSideB);
+	const TSoftObjectPtr<UObject> Current = Chosen(bSideB);
 
 	if (Choices.Num() == 0)
 	{
@@ -957,7 +1336,7 @@ TSharedRef<SWidget> SMeshDefPreview::BuildChoiceMenu(bool bSideB)
 
 	for (const FMeshChoice& Choice : Choices)
 	{
-		const TSoftObjectPtr<UStaticMesh> Mesh = Choice.Mesh;
+		const TSoftObjectPtr<UObject> Mesh = Choice.Mesh;
 		const bool bIsCurrentImport = Def && (Mesh == Def->ImportedMesh);
 
 		Menu.AddMenuEntry(
@@ -1007,7 +1386,7 @@ TSharedRef<SWidget> SMeshDefPreview::BuildViewModeMenu()
 	return Menu.MakeWidget();
 }
 
-TSoftObjectPtr<UStaticMesh> SMeshDefPreview::Chosen(bool bSideB) const
+TSoftObjectPtr<UObject> SMeshDefPreview::Chosen(bool bSideB) const
 {
 	if (bSideB)
 	{
@@ -1022,10 +1401,22 @@ TSoftObjectPtr<UStaticMesh> SMeshDefPreview::Chosen(bool bSideB) const
 	}
 
 	const UMeshDef* Def = Definition.Get();
-	return Def ? Def->ImportedMesh : TSoftObjectPtr<UStaticMesh>();
+	if (Def == nullptr)
+	{
+		return TSoftObjectPtr<UObject>();
+	}
+
+	// The skinned result first, the same order the Content Browser tile uses: where a chain made
+	// both, the skinned one is the later of the two and the one the chain was run for.
+	if (!Def->ImportedSkeletalMesh.IsNull())
+	{
+		return TSoftObjectPtr<UObject>(Def->ImportedSkeletalMesh.ToSoftObjectPath());
+	}
+
+	return TSoftObjectPtr<UObject>(Def->ImportedMesh.ToSoftObjectPath());
 }
 
-void SMeshDefPreview::Choose(bool bSideB, TSoftObjectPtr<UStaticMesh> Mesh)
+void SMeshDefPreview::Choose(bool bSideB, TSoftObjectPtr<UObject> Mesh)
 {
 	(bSideB ? ChosenB : ChosenA) = Mesh;
 	ApplyMeshes();
@@ -1044,7 +1435,7 @@ void SMeshDefPreview::SetCompare(bool bOn)
 	// guess: the next take down the list, or the same mesh if there is only one.
 	if (bOn && ChosenB.IsNull())
 	{
-		const TSoftObjectPtr<UStaticMesh> A = Chosen(false);
+		const TSoftObjectPtr<UObject> A = Chosen(false);
 
 		for (const FMeshChoice& Choice : Choices)
 		{
@@ -1067,7 +1458,7 @@ void SMeshDefPreview::SetCompare(bool bOn)
 
 void SMeshDefPreview::Swap()
 {
-	const TSoftObjectPtr<UStaticMesh> A = Chosen(false);
+	const TSoftObjectPtr<UObject> A = Chosen(false);
 
 	ChosenA = ChosenB;
 	ChosenB = A;
@@ -1082,8 +1473,8 @@ void SMeshDefPreview::ApplyMeshes()
 		return;
 	}
 
-	UStaticMesh* A = Chosen(false).LoadSynchronous();
-	UStaticMesh* B = bCompare ? Chosen(true).LoadSynchronous() : nullptr;
+	UObject* A = Chosen(false).LoadSynchronous();
+	UObject* B = bCompare ? Chosen(true).LoadSynchronous() : nullptr;
 
 	// Never framed by SetMesh. Two meshes of different sizes have to share one framing or the
 	// comparison is between two distances from the camera, and whichever side was set last would
@@ -1095,9 +1486,6 @@ void SMeshDefPreview::ApplyMeshes()
 		ViewportB->SetMesh(B, /*bFrame*/ false);
 	}
 
-	AlignScale    = 1.0f;
-	AlignRotation = FRotator::ZeroRotator;
-
 	// **Only when the choice changes.** Refresh runs whenever any job in the editor changes state,
 	// and a viewer that re-framed on each of those would snatch the camera back to
 	// three-quarters-from-above while somebody was leaning into a seam.
@@ -1106,38 +1494,23 @@ void SMeshDefPreview::ApplyMeshes()
 		|| (bFramedCompare != bCompare)
 		|| (bFramedAlign != bAlign);
 
-	const MeshDefPreviewPrivate::FSubject SubjectA = MeshDefPreviewPrivate::Measure(A);
-
-	// A is never moved except onto the pivot: it is the reference, so "aligned" means one thing
-	// rather than depending on which side you happen to be looking at.
-	if (A != nullptr)
+	// The second viewport stops being a side when the seam is put away, and nothing will ask an
+	// extension for its companions again - so they come out here rather than being left to reappear
+	// the next time two takes are compared.
+	if (!bCompare && ViewportB.IsValid())
 	{
-		Viewport->SetSubjectTransform(FTransform(-SubjectA.Centre));
+		ViewportB->ClearCompanions();
 	}
 
-	if (B != nullptr && ViewportB.IsValid())
+	// Told before anything is placed: whether an extension puts a character in decides which space
+	// both subjects are placed in, so the answer has to be in before the placing starts. Each call
+	// to SetCompanions places what is there at that moment; ApplySpace below is the last word.
+	for (const TSharedRef<IMeshDefPreviewExtension>& Extension : Extensions)
 	{
-		const MeshDefPreviewPrivate::FSubject SubjectB = MeshDefPreviewPrivate::Measure(B);
-
-		if (bAlign && A != nullptr)
-		{
-			AlignRotation = MeshDefPreviewPrivate::BestRotation(SubjectB, SubjectA);
-			AlignScale    = SubjectA.Radius / SubjectB.Radius;
-
-			const FQuat Turn = AlignRotation.Quaternion();
-
-			// Turned about its own centre, then dropped on the pivot A is sitting on.
-			FTransform Fit(Turn);
-			Fit.SetScale3D(FVector(AlignScale));
-			Fit.SetTranslation(-Turn.RotateVector(SubjectB.Centre) * AlignScale);
-
-			ViewportB->SetSubjectTransform(Fit);
-		}
-		else
-		{
-			ViewportB->SetSubjectTransform(FTransform(-SubjectB.Centre));
-		}
+		Extension->OnPreviewChanged();
 	}
+
+	ApplySpace();
 
 	if (!bChanged)
 	{
@@ -1149,29 +1522,180 @@ void SMeshDefPreview::ApplyMeshes()
 	bFramedCompare = bCompare;
 	bFramedAlign   = bAlign;
 
-	const TSharedPtr<FMeshDefPreviewClient> Client = Viewport->GetClient();
-
-	if (!Client.IsValid() || (A == nullptr && B == nullptr))
+	if (A == nullptr && B == nullptr)
 	{
 		return;
 	}
 
-	// Framed on the union of what is actually on screen - which, once both are centred on the
-	// pivot and B is fitted to A, is a sphere about the origin.
-	const float Radius = (A != nullptr)
-		? SubjectA.Radius
-		: MeshDefPreviewPrivate::Measure(B).Radius;
+	Reframe();
+}
 
-	float Widest = Radius;
-
-	if (!bAlign && A != nullptr && B != nullptr)
+bool SMeshDefPreview::IsTrueSpace() const
+{
+	if (Viewport.IsValid() && Viewport->HasCompanions())
 	{
-		// Unaligned, the two are their own sizes and the framing has to hold the larger.
-		Widest = FMath::Max(Radius, MeshDefPreviewPrivate::Measure(B).Radius);
+		return true;
 	}
 
-	Client->FrameBounds(FBoxSphereBounds(FVector::ZeroVector,
-		FVector(Widest), Widest));
+	return bCompare && ViewportB.IsValid() && ViewportB->HasCompanions();
+}
+
+void SMeshDefPreview::ApplySpace()
+{
+	if (!Viewport.IsValid())
+	{
+		return;
+	}
+
+	UObject* A = Chosen(false).LoadSynchronous();
+	UObject* B = bCompare ? Chosen(true).LoadSynchronous() : nullptr;
+
+	AlignScale     = 1.0f;
+	AlignRotation  = FRotator::ZeroRotator;
+	TrueSpaceRatio = 1.0f;
+
+	const bool bTrueSpace = IsTrueSpace();
+
+	if (bTrueSpace)
+	{
+		if (A != nullptr && B != nullptr)
+		{
+			const float RadiusA = MeshDefPreviewPrivate::Measure(A).Radius;
+			const float RadiusB = MeshDefPreviewPrivate::Measure(B).Radius;
+
+			TrueSpaceRatio = (RadiusA > KINDA_SMALL_NUMBER) ? (RadiusB / RadiusA) : 1.0f;
+		}
+
+		// Nothing is done to anything. Both meshes and everything beside them stand where their own
+		// data puts them, at their own size - the picture a level would give with all of them
+		// dropped at 0, 0, 0. A garment that was wrapped around this character lands on it exactly;
+		// one that was not hangs wrong, and that is the answer rather than a fault in the viewer.
+		Viewport->SetSubjectTransform(FTransform::Identity);
+
+		if (ViewportB.IsValid())
+		{
+			ViewportB->SetSubjectTransform(FTransform::Identity);
+		}
+	}
+	else
+	{
+		const MeshDefPreviewPrivate::FSubject SubjectA = MeshDefPreviewPrivate::Measure(A);
+
+		// A is never moved except onto the pivot: it is the reference, so "aligned" means one thing
+		// rather than depending on which side you happen to be looking at.
+		if (A != nullptr)
+		{
+			Viewport->SetSubjectTransform(FTransform(-SubjectA.Centre));
+		}
+
+		if (B != nullptr && ViewportB.IsValid())
+		{
+			const MeshDefPreviewPrivate::FSubject SubjectB = MeshDefPreviewPrivate::Measure(B);
+
+			if (bAlign && A != nullptr)
+			{
+				AlignRotation = MeshDefPreviewPrivate::BestRotation(SubjectB, SubjectA);
+				AlignScale    = SubjectA.Radius / SubjectB.Radius;
+
+				const FQuat Turn = AlignRotation.Quaternion();
+
+				// Turned about its own centre, then dropped on the pivot A is sitting on.
+				FTransform Fit(Turn);
+				Fit.SetScale3D(FVector(AlignScale));
+				Fit.SetTranslation(-Turn.RotateVector(SubjectB.Centre) * AlignScale);
+
+				ViewportB->SetSubjectTransform(Fit);
+			}
+			else
+			{
+				ViewportB->SetSubjectTransform(FTransform(-SubjectB.Centre));
+			}
+		}
+	}
+
+	// The camera follows the space, not every change within it: a character swapped for another
+	// leaves the picture the same size and the camera where somebody put it.
+	if (bTrueSpace != bFramedTrueSpace)
+	{
+		bFramedTrueSpace = bTrueSpace;
+		Reframe();
+	}
+}
+
+void SMeshDefPreview::Reframe()
+{
+	if (!Viewport.IsValid())
+	{
+		return;
+	}
+
+	const TSharedPtr<FMeshDefPreviewClient> Client = Viewport->GetClient();
+
+	if (!Client.IsValid())
+	{
+		return;
+	}
+
+	// The union of what is actually drawn, companions included. Framing the subject alone would
+	// put the head and the knees of a character standing behind a shirt off screen - which is the
+	// one thing it was put there to show.
+	FBoxSphereBounds Visible = Viewport->GetVisibleBounds();
+
+	if (bCompare && ViewportB.IsValid())
+	{
+		Visible = Visible + ViewportB->GetVisibleBounds();
+	}
+
+	if (Visible.SphereRadius <= KINDA_SMALL_NUMBER)
+	{
+		return;
+	}
+
+	Client->FrameBounds(Visible);
+}
+
+UObject* SMeshDefPreview::GetSubject(int32 Side) const
+{
+	if (Side == 0)
+	{
+		return Viewport.IsValid() ? Viewport->GetMesh() : nullptr;
+	}
+
+	return (bCompare && ViewportB.IsValid()) ? ViewportB->GetMesh() : nullptr;
+}
+
+void SMeshDefPreview::SetCompanions(FName ExtensionId, int32 Side, const TArray<USceneComponent*>& Components)
+{
+	const TSharedPtr<SMeshDefPreviewViewport> Target = (Side == 0) ? Viewport : ViewportB;
+
+	if (Target.IsValid())
+	{
+		Target->SetCompanions(ExtensionId, Components);
+	}
+
+	// A companion arriving or leaving changes which space the viewer is in, so both subjects are
+	// placed again. This is also the path a person takes when they pick a character from the menu,
+	// which happens nowhere near ApplyMeshes.
+	ApplySpace();
+}
+
+void SMeshDefPreview::Redraw()
+{
+	if (Viewport.IsValid())
+	{
+		if (const TSharedPtr<FMeshDefPreviewClient> Client = Viewport->GetClient())
+		{
+			Client->Invalidate();
+		}
+	}
+
+	if (ViewportB.IsValid())
+	{
+		if (const TSharedPtr<FMeshDefPreviewClient> Client = ViewportB->GetClient())
+		{
+			Client->Invalidate();
+		}
+	}
 }
 
 void SMeshDefPreview::ApplyViewMode()
@@ -1193,9 +1717,24 @@ void SMeshDefPreview::ApplyViewMode()
 	}
 }
 
+void SMeshDefPreview::ApplyFloor()
+{
+	const bool bVisible = UMeshForgeEditorSettings::Get()->bShowPreviewFloor;
+
+	if (Viewport.IsValid())
+	{
+		Viewport->SetFloorVisible(bVisible);
+	}
+
+	if (ViewportB.IsValid())
+	{
+		ViewportB->SetFloorVisible(bVisible);
+	}
+}
+
 FText SMeshDefPreview::ChoiceLabel(bool bSideB) const
 {
-	const TSoftObjectPtr<UStaticMesh> Mesh = Chosen(bSideB);
+	const TSoftObjectPtr<UObject> Mesh = Chosen(bSideB);
 
 	if (Mesh.IsNull())
 	{
@@ -1211,6 +1750,28 @@ FText SMeshDefPreview::ChoiceLabel(bool bSideB) const
 	}
 
 	return FText::FromString(FPackageName::ObjectPathToObjectName(Mesh.ToString()));
+}
+
+FText SMeshDefPreview::AlignTooltip() const
+{
+	if (IsTrueSpace())
+	{
+		return LOCTEXT("AlignTipTrueSpace",
+			"Not while something is standing beside the mesh.\n\n"
+			"Align throws away size and position so two takes can be compared on shape alone - and "
+			"those are the two things a character is in the picture to check. With one there, "
+			"everything is drawn at its own size and its own pivot, exactly as a level would show it "
+			"with all of them dropped at 0, 0, 0. A garment that fits, fits; one that does not, "
+			"hangs wrong.");
+	}
+
+	return LOCTEXT("AlignTip",
+		"Fit B onto A: same centre, same size, and turned by whichever quarter turn best "
+		"matches its shape to A's.\n\n"
+		"Two generators disagree about which way is up, not by nineteen degrees, so a "
+		"quarter turn is usually the whole difference. A is never moved, the strip below "
+		"says what B was fitted by, and both meshes true dimensions are reported whatever "
+		"this is set to.");
 }
 
 FText SMeshDefPreview::ViewModeLabel() const
@@ -1272,14 +1833,29 @@ FText SMeshDefPreview::StatsText() const
 		return FText::GetEmpty();
 	}
 
-	const FText A = Viewport->DescribeMesh();
+	const bool bTrueSpace = IsTrueSpace();
+
+	const FText A = Viewport->DescribeMesh(bTrueSpace);
 
 	if (!bCompare || !ViewportB.IsValid())
 	{
 		return A;
 	}
 
-	const FText B = ViewportB->DescribeMesh();
+	const FText B = ViewportB->DescribeMesh(bTrueSpace);
+
+	// In true space nothing was done to either of them, so the only thing left to say is how they
+	// differ - said as a number, because "the second one looks bigger" is not a finding. The ratio
+	// was worked out when they were placed; this text is read every frame.
+	if (bTrueSpace)
+	{
+		FNumberFormattingOptions TwoDigits;
+		TwoDigits.SetMaximumFractionalDigits(2);
+
+		return FText::Format(
+			LOCTEXT("StatsABTrue", "A  {0}\nB  {1}\ntrue space - nothing moved or scaled. B is {2}x A."),
+			A, B, FText::AsNumber(TrueSpaceRatio, &TwoDigits));
+	}
 
 	// **What the fit did, said rather than left to be noticed.** A viewer that silently resizes and
 	// turns one of two things being compared is a viewer that cannot be trusted for the comparison

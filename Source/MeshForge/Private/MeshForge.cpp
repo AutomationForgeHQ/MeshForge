@@ -4,6 +4,8 @@
 #include "ForgeKeyRegistry.h"
 #endif
 #include "MeshCredentialStore.h"
+#include "MeshDef.h"
+#include "AssetRegistry/AssetRegistryModule.h"
 #include "MeshForgeSettings.h"
 #include "MeshForgeSubsystem.h"
 #include "IMeshProvider.h"
@@ -146,6 +148,71 @@ namespace MeshForgeConsole
 			Outcome.Materials.Num(), Outcome.Textures.Num());
 	}
 
+	/**
+	 * For every definition, compare each stage's stored input hash with the one it computes now.
+	 *
+	 * A stage saved as ready whose hash no longer matches would show as stale the next time its panel
+	 * opens. Written to prove that changing how hashes are built left existing definitions alone, and
+	 * kept because the same question comes up whenever that code is touched again.
+	 */
+	static void VerifyStageHashes(const TArray<FString>& Args)
+	{
+		FARFilter Filter;
+		Filter.ClassPaths.Add(UMeshDef::StaticClass()->GetClassPathName());
+		Filter.PackagePaths.Add(FName(Args.Num() > 0 ? *Args[0] : TEXT("/Game")));
+		Filter.bRecursivePaths = true;
+
+		TArray<FAssetData> Assets;
+		FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get().GetAssets(Filter, Assets);
+
+		int32 Compared = 0, Mismatched = 0;
+		for (const FAssetData& Asset : Assets)
+		{
+			const UMeshDef* Def = Cast<UMeshDef>(Asset.GetAsset());
+			if (Def == nullptr)
+			{
+				continue;
+			}
+
+			for (const TPair<EMeshStage, FMeshStageState>& Stage : Def->Stages)
+			{
+				if (Stage.Value.InputsHash.IsEmpty() || Stage.Value.Status != EMeshStageStatus::Ready)
+				{
+					continue;
+				}
+
+				++Compared;
+				if (Stage.Value.InputsHash != Def->ComputeStageHash(Stage.Key))
+				{
+					++Mismatched;
+					UE_LOG(LogMeshForge, Display, TEXT("  %s: %s saved ready, inputs now hash differently."),
+						*Def->GetName(), *StaticEnum<EMeshStage>()->GetNameStringByValue(static_cast<int64>(Stage.Key)));
+				}
+			}
+		}
+
+		UE_LOG(LogMeshForge, Display, TEXT("Stage hashes: %d definition(s), %d ready stage(s) compared, %d no longer match."),
+			Assets.Num(), Compared, Mismatched);
+	}
+
+	static FAutoConsoleCommand VerifyStageHashesCmd(
+		TEXT("MeshForge.VerifyStageHashes"),
+		TEXT("Report definitions whose stages were saved ready but whose inputs now hash differently. Optional argument: a content folder."),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&VerifyStageHashes));
+
+	static void RebuildThumbnails(const TArray<FString>& Args)
+	{
+		if (UMeshForgeSubsystem* Subsystem = UMeshForgeSubsystem::Get())
+		{
+			Subsystem->RebuildDefinitionThumbnails(Args.Num() > 0 ? Args[0] : FString());
+		}
+	}
+
+	static FAutoConsoleCommand RebuildThumbnailsCmd(
+		TEXT("MeshForge.RebuildThumbnails"),
+		TEXT("Regenerate and save the Content Browser thumbnail of every Mesh Definition. Optional argument: a content folder, default /Game."),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&RebuildThumbnails));
+
 	static FAutoConsoleCommand ListCmd(
 		TEXT("MeshForge.ListProviders"),
 		TEXT("List registered mesh providers and whether each is ready to generate."),
@@ -269,6 +336,56 @@ TArray<FName> FMeshForgeModule::GetProviderIds() const
 	return Ids;
 }
 
+void FMeshForgeModule::RegisterPostStepType(const FMeshForgePostStepType& Type)
+{
+	// Refused with a sentence rather than asserted: the caller is another plugin, and a check() would
+	// take the editor down for somebody else's typo.
+	if (Type.Id.IsNone() || Type.SettingsClass == nullptr || !Type.Run)
+	{
+		UE_LOG(LogMeshForge, Error,
+			TEXT("A post step from '%s' was not registered: it needs an id, a settings class and a Run function."),
+			*Type.OwningPlugin);
+		return;
+	}
+
+	const bool bReplaced = PostStepTypes.Contains(Type.Id);
+	PostStepTypes.Add(Type.Id, MakeShared<FMeshForgePostStepType>(Type));
+
+	UE_LOG(LogMeshForge, Log, TEXT("Post step '%s' from %s %s."),
+		*Type.Id.ToString(), *Type.OwningPlugin, bReplaced ? TEXT("re-registered") : TEXT("registered"));
+
+	OnPostStepTypesChanged.Broadcast();
+}
+
+void FMeshForgeModule::UnregisterPostStepType(FName Id)
+{
+	if (PostStepTypes.Remove(Id) > 0)
+	{
+		UE_LOG(LogMeshForge, Log, TEXT("Post step '%s' unregistered."), *Id.ToString());
+		OnPostStepTypesChanged.Broadcast();
+	}
+}
+
+const FMeshForgePostStepType* FMeshForgeModule::FindPostStepType(FName Id) const
+{
+	const TSharedRef<FMeshForgePostStepType>* Found = PostStepTypes.Find(Id);
+	return Found ? &Found->Get() : nullptr;
+}
+
+TArray<const FMeshForgePostStepType*> FMeshForgeModule::GetPostStepTypes() const
+{
+	TArray<const FMeshForgePostStepType*> Types;
+	for (const TPair<FName, TSharedRef<FMeshForgePostStepType>>& Pair : PostStepTypes)
+	{
+		Types.Add(&Pair.Value.Get());
+	}
+	Types.Sort([](const FMeshForgePostStepType& A, const FMeshForgePostStepType& B)
+	{
+		return A.DisplayName.CompareTo(B.DisplayName) < 0;
+	});
+	return Types;
+}
+
 void FMeshForgeModule::StartupModule()
 {
 	// Nothing to register. Every mesh provider is an add-on; see the class comment.
@@ -277,6 +394,7 @@ void FMeshForgeModule::StartupModule()
 void FMeshForgeModule::ShutdownModule()
 {
 	Providers.Empty();
+	PostStepTypes.Empty();
 }
 
 #undef LOCTEXT_NAMESPACE

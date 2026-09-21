@@ -39,4 +39,28 @@ public:
 		meta = (GetOptions = "/Script/MeshForge.MeshForgeSettings.GetProviderOptions"))
 	FName ProviderOverride;
 
+	/**
+	 * Blender, for the "Edit in Blender" post step. Empty looks in the usual places.
+	 *
+	 * On Windows that is every `Blender Foundation\Blender *` under Program Files, newest first;
+	 * elsewhere, `blender` on the PATH. Mine rather than the team's, because where Blender is installed
+	 * is a fact about this machine.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Blender",
+		meta = (FilePathFilter = "Blender executable (blender.exe)|blender.exe|All files (*.*)|*.*"))
+	FFilePath BlenderExecutable;
+
+	/** The Blender this machine would launch, after applying the rule above. Empty when none is found. */
+	FString ResolveBlender() const;
+
+	/**
+	 * Show the floor in a definition's Mesh tab. Off by default.
+	 *
+	 * Most generated meshes keep their pivot at their centre, so the floor cuts through the middle of
+	 * them. Turn it on for a prop that has been finished with its origin at its base. Set from the tab's
+	 * own Floor checkbox, and remembered here.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Preview")
+	bool bShowPreviewFloor = false;
+
 };
