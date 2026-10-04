@@ -8,6 +8,11 @@ not for the commit log.
 Headings are `## <x.y.z> — <date>`. Use `Added` / `Changed` / `Fixed` / `Compatibility` /
 `Known issues`, only the ones that apply.
 
+## 0.3.1 — 2026-10-04
+
+### Changed
+- Copyright and licence notices now name Bojan Andrejek / MetaWorx LLC. It is still Apache 2.0, and nothing about how you may use it changed.
+
 ## 0.3.0 — 2026-09-21
 
 ### Added
