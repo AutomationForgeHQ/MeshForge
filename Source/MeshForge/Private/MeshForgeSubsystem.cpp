@@ -2377,6 +2377,21 @@ FGuid UMeshForgeSubsystem::StartPostSteps(UMeshDef* Def, const TArray<int32>& Re
 	// Resolve and freeze every independent input before starting any work. Only an explicitly
 	// connected predecessor in this run supplies fresh bytes; a single-step run uses saved assets.
 	TArray<FMeshPostJob> Inputs;
+
+	// The definition's main picture, offered to every step as FMeshPostJob::InputImages promises.
+	// It was declared and never filled, so a step that paints from what the mesh was made from - Lux3D's
+	// material-transfer - was handed nothing on a definition with a picture in its gallery. Read once,
+	// here on the game thread, because the steps run on a worker where a texture cannot be loaded.
+	TArray<TArray<uint8>> DefinitionImages;
+	{
+		TArray<uint8> MainPng;
+		FString Unused;
+		if (ResolveSourceImage(Def, MainPng, Unused))
+		{
+			DefinitionImages.Add(MoveTemp(MainPng));
+		}
+	}
+
 	TArray<int32> FreshFrom;   // which earlier step in this run supplies the input, or INDEX_NONE
 	TArray<FString> InputPaths;
 	for (int32 Index = 0; Index < Steps.Num(); ++Index)
@@ -2410,6 +2425,7 @@ FGuid UMeshForgeSubsystem::StartPostSteps(UMeshDef* Def, const TArray<int32>& Re
 		FreshFrom.Add(From);
 		FMeshPostJob& Input = Inputs.AddDefaulted_GetRef();
 		Input.Name = Def->GetName(); Input.Prompt = Def->GetBrief();
+		Input.InputImages = DefinitionImages;
 		InputPaths.Add(FString());
 		TSoftObjectPtr<UObject> Mesh;
 		if (From == INDEX_NONE)

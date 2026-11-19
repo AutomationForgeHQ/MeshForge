@@ -8,6 +8,12 @@ not for the commit log.
 Headings are `## <x.y.z> — <date>`. Use `Added` / `Changed` / `Fixed` / `Compatibility` /
 `Known issues`, only the ones that apply.
 
+## 0.3.2 — 2026-11-19
+
+### Fixed
+- Post-processing steps now receive the definition's main picture. A step that paints from the picture
+  the mesh was made from was told there was none.
+
 ## 0.3.1 — 2026-10-04
 
 ### Changed

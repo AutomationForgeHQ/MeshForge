@@ -4,7 +4,7 @@ Describe a prop or drop a reference image, generate it with an AI mesh provider,
 game-ready static mesh in your project — with its textures, materials, collision, lightmap UVs and
 a pivot that sits on the floor.
 
-<!-- forge:version -->**Version 0.3.1. Beta.**<!-- /forge:version -->
+<!-- forge:version -->**Version 0.3.2. Beta.**<!-- /forge:version -->
 
 ---
 
@@ -19,8 +19,8 @@ prompt / image  ->  provider  ->  glTF  ->  static mesh + materials + textures  
 It is **provider-agnostic**. MeshForge ships no generator of its own; every one is an add-on that
 registers through the same interface. Today that is
 [MeshForgeTrellis](https://kovati.dev/plugins/meshforge/) — Microsoft's TRELLIS.2, running locally in Docker, free —
-and [MeshForgeCloud](https://kovati.dev/plugins/meshforge/), which wires up hosted providers (Meshy, Tripo) on your own
-API key. Hosted services fit the same shape, and are already shipped, not just hypothetical.
+and [MeshForgeCloud](https://kovati.dev/plugins/meshforge/), which wires up hosted providers (Meshy, Tripo, Aholo Lux3D) on your
+own API key. Hosted services fit the same shape, and are already shipped, not just hypothetical.
 
 An empty provider list is therefore a normal state, not a fault, and the editor says so.
 
@@ -131,7 +131,7 @@ outstanding: *choosing* which pictures the generator sees works and is where mos
 yet. On a provider whose image endpoint already removes backgrounds and draws multiple views, that
 half is unnecessary rather than missing. Post, by contrast, is built and runs: steps execute
 individually or as a chain, each with its own input source, and the shipped pipelines are Meshy and
-Tripo retexture plus MeshForgeGarment's fit and skinning steps.
+Tripo retexture, Lux3D retopology and material transfer, plus MeshForgeGarment's fit and skinning steps.
 
 ### Workflows: which stages a definition uses, and what they run
 
@@ -263,11 +263,11 @@ details panel and the agent option list are generated from the same declaration 
 | Kind | Ships today | Proven |
 |---|---|---|
 | Image | `Image - Local (this machine's GPU)` (MeshForgeTrellis) | 106s cold, 23s warm, free |
-| Image | `Image - Meshy (nano-banana, GPT Image)`, `Image - Tripo API v3`, `Image - Tripo multi-view (4 angles)` (MeshForgeCloud) | nano-banana: 19s, 3 credits |
-| Mesh | `Meshy - Standard (high quality)`, `Meshy - Smart lowpoly (T2)`, `Tripo - Photoreal (H3)`, `Tripo - Game ready (P2/P1)` (MeshForgeCloud) | measured on meshy-7 — 1,943,800 triangles for 30 credits; 6,275 for 15 on Smart lowpoly |
+| Image | `Image - Meshy (nano-banana, GPT Image)`, `Image - Tripo API v3`, `Image - Tripo multi-view (4 angles)`, `Image - Lux3D multimodal-to-image`, `Image - Lux3D image-to-four-view` (MeshForgeCloud) | nano-banana: 19s, 3 credits |
+| Mesh | `Meshy - Standard (high quality)`, `Meshy - Smart lowpoly (T2)`, `Tripo - Photoreal (H3)`, `Tripo - Game ready (P2/P1)`, `Lux3D - G1 / G1-Turbo` (MeshForgeCloud) | measured on meshy-7 — 1,943,800 triangles for 30 credits; 6,275 for 15 on Smart lowpoly |
 | Mesh | TRELLIS.2 (MeshForgeTrellis) — chosen as a provider, with its settings and no pipeline class | |
 | Refine | — | |
-| Post | `Edit in Blender - round trip` (MeshForge), `Meshy - retexture`, `Tripo - retexture` (MeshForgeCloud); MeshForgeGarment adds `Garment fit`, `Wardrobe skinning` and `Sculpt mesh - in the editor`, NP_Clothing adds a clothing item step | |
+| Post | `Edit in Blender - round trip` (MeshForge), `Meshy - retexture`, `Tripo - retexture`, `Lux3D - mesh-retopology`, `Lux3D - material-transfer (retexture)` (MeshForgeCloud); MeshForgeGarment adds `Garment fit`, `Wardrobe skinning` and `Sculpt mesh - in the editor`, NP_Clothing adds a clothing item step | |
 
 **An image pipeline does its own work, and that is a deliberate exception.** Everywhere else a
 pipeline declares and a provider acts. A provider interface can only carry what every provider has
