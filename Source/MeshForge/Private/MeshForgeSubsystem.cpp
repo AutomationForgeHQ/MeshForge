@@ -3109,12 +3109,19 @@ void UMeshForgeSubsystem::FinishPostChain(const FGuid& JobId,
 			Native.DefinitionName = Def->GetName();
 			Native.DefinitionPath = Def->GetPathName();
 			Native.Prompt = Def->GetBrief();
+			// Back through the chain to the first static mesh. A step can make a skeletal mesh from a skeletal
+			// mesh, and one step back would then lose the wrapped static mesh later steps show on the ground.
+			FSoftObjectPath MadeFrom = Previous.ToSoftObjectPath();
 			for (int32 Earlier = Def->PostOutputs.Num() - 1; Earlier >= 0; --Earlier)
 			{
-				if (Def->PostOutputs[Earlier].Asset.ToSoftObjectPath() == Previous.ToSoftObjectPath())
+				if (Def->PostOutputs[Earlier].Asset.ToSoftObjectPath() == MadeFrom)
 				{
-					Native.InputMadeFrom = Def->PostOutputs[Earlier].Input.ToSoftObjectPath();
-					break;
+					MadeFrom = Def->PostOutputs[Earlier].Input.ToSoftObjectPath();
+					Native.InputMadeFrom = MadeFrom;
+					if (Cast<UStaticMesh>(MadeFrom.TryLoad()))
+					{
+						break;
+					}
 				}
 			}
 			UObject* Made = Pipeline->CreateNativeOutput(Input, Native, Failure);

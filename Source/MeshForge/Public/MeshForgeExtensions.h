@@ -24,8 +24,10 @@ struct FMeshForgePostStepContext
 	UObject* Input = nullptr;
 
 	/**
-	 * What Input was itself made from, where the chain recorded it: for a skinned garment, the wrapped
-	 * static mesh it was skinned from. Null when Input was chosen by hand or has no recorded source.
+	 * What Input was made from, where the chain recorded it, followed back to the first static mesh: for
+	 * a skinned garment, however many steps later, the wrapped static mesh it was skinned from. If the
+	 * chain holds no static mesh, the earliest source it recorded. Null when Input was chosen by hand or
+	 * has no recorded source.
 	 */
 	UObject* InputMadeFrom = nullptr;
 

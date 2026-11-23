@@ -202,7 +202,7 @@ struct MESHFORGE_API FMeshPostNativeContext
 	FString DefinitionPath;
 	FString Prompt;
 
-	/** The recorded input of the output this step is working on, where there is one. */
+	/** What the chain recorded this output as made from, followed back to the first static mesh where there is one. */
 	FSoftObjectPath InputMadeFrom;
 
 	/** Written by the step: one line saying what it did. */

@@ -1,10 +1,17 @@
+<!-- kovati:header -->
+<p align="center"><a href="https://kovati.dev/tools/meshforge/"><img src="https://raw.githubusercontent.com/AutomationForgeHQ/.github/main/profile/assets/meshforge.jpg" width="100%" alt="MeshForge, part of Kovati" /></a></p>
+
+<p align="center">Part of <a href="https://kovati.dev"><b>Kovati</b></a>, production tools for Unreal games · <a href="https://kovati.dev/worldbuilding/">Worldbuilding</a><br />
+<a href="https://kovati.dev/tools/meshforge/">Product page</a> · <a href="https://docs.kovati.dev">Documentation</a> · <a href="https://kovati.dev/download/">Install with the Kovati Hub</a> · <a href="https://kovati.dev/discord">Discord</a></p>
+<!-- /kovati:header -->
+
 # MeshForge
 
 Describe a prop or drop a reference image, generate it with an AI mesh provider, and get a
 game-ready static mesh in your project — with its textures, materials, collision, lightmap UVs and
 a pivot that sits on the floor.
 
-<!-- forge:version -->**Version 0.3.2. Beta.**<!-- /forge:version -->
+<!-- forge:version -->**Version 0.3.3. Beta.**<!-- /forge:version -->
 
 ---
 

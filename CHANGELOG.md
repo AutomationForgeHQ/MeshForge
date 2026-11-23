@@ -8,6 +8,11 @@ not for the commit log.
 Headings are `## <x.y.z> — <date>`. Use `Added` / `Changed` / `Fixed` / `Compatibility` /
 `Known issues`, only the ones that apply.
 
+## 0.3.3 — unreleased
+
+### Fixed
+- A post step that turns one skeletal mesh into another (such as Parametric outfit) no longer hides the original static mesh from the steps after it, so a clothing item made later in the chain gets its pickup mesh and icon again.
+
 ## 0.3.2 — 2026-11-19
 
 ### Fixed

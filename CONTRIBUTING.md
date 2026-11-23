@@ -1,7 +1,7 @@
 # Contributing
 
 This repository is the **published source** of `MeshForge`, part of the
-[Automation Forge](https://github.com/AutomationForgeHQ) suite for Unreal Engine.
+[Kovati](https://kovati.dev) production tools for Unreal Engine.
 Its contents are replaced by each release, so a pull request opened here cannot be
 merged and would be overwritten by the next one.
 
